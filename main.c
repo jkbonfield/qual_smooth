@@ -176,7 +176,7 @@ void usage(void) {
     printf("Options are:\n");
     printf("  -I FMT[,OPTS]  Specify input format and options\n");
     printf("  -O FMT[,OPTS]  Specify output format and options\n");
-    printf("  -k INT         Keep quality INT intact\n");
+    printf("  -k INT[,INT]   Keep quality INT range intact\n");
     printf("  -P INT         P-block smoothing within +/- INT [%d]\n", PLEVEL);
     printf("  -R FLOAT       R-block smoothing within +/- FLOAT [%f]\n", RLEVEL);
     printf("  -B INT         Bin qualities with bin width INT [%d]\n", BLEVEL);
@@ -211,11 +211,24 @@ int main(int argc, char **argv) {
     gen_map(blevel); // default
 
     int c;
-    while ((c = getopt(argc, argv, "P:B:O:I:b:t:R:v")) >= 0) {
+    while ((c = getopt(argc, argv, "P:B:O:I:b:t:R:vk:")) >= 0) {
 	switch(c) {
 	case 'I': hts_parse_format(&in_fmt, optarg); break;
 	case 'O': hts_parse_format(&out_fmt, optarg); break;
-	case 'k': qpreserve[MAX(255, MIN(0, atoi(optarg)))] = 1; break;
+
+	case 'k': {
+	    char *endp = optarg;
+	    do {
+		long q1 = strtol(endp, &endp, 10), q2 = q1;
+		if (*endp == '-')
+		    q2 = strtol(endp+1, &endp, 10);
+		do {
+		    qpreserve[MAX(0,MIN(255,q1))] = 1 + (c == 'K');
+		} while (++q1 <= q2);
+	    } while (*endp++ == ',');
+	    break;
+	}
+
 	case 'P': plevel = MAX(0, atoi(optarg)); break;
 	case 'R': rlevel = MAX(1, atof(optarg)); break;
 	case 'v': verbose++; break;
