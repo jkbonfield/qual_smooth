@@ -1,14 +1,20 @@
 Building
 --------
 
-S=/nfs/users/nfs_j/jkb/work/samtools_master/htslib
-cc -Wall -O3 -g main.c -o qual_smooth -I$S -L$S -lhts -Wl,-R$S
+Edit the Makefile to specify the location of htslib and htscodecs
+directories.
 
+Note, these are currently coded up to point to built source trees, but
+they could also point to official installs in e.g. /usr/lib and /usr/include.
+
+Then build with:
+
+    make
 
 Running
 -------
 
-./qual_smooth -O cram,reference=$HREF38 -P5 -B10 PB.bam PB_qs.cram
+    ./qual_smooth -O cram,reference=$HREF38 -P5 -B10 PB.bam PB_qs.cram
 
 
 Options
