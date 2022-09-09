@@ -47,7 +47,8 @@ static int parse_map(char *str) {
 	while (*str == ',')
 	    str++;
 	if (*str && !isdigit(*str)) {
-	    fprintf(stderr, "Incorrect format: should be low-high=val\n");
+	    fprintf(stderr, "Incorrect format '%s': should be low-high=val\n",
+		    str);
 	    return 1;
 	}
 
@@ -56,7 +57,8 @@ static int parse_map(char *str) {
 	if (ret <= 0) {
 	    break;
 	} else if (ret != 3) {
-	    fprintf(stderr, "Incorrect format: should be low-high=val\n");
+	    fprintf(stderr, "Incorrect format '%s': should be low-high=val\n",
+		    str);
 	    return 1;
 	}
 	str += n;
@@ -182,6 +184,12 @@ void usage(void) {
     printf("  -B INT         Bin qualities with bin width INT [%d]\n", BLEVEL);
     printf("  -b [A-B=C],... Map qualities A to B inclusive to C; a list\n");
     printf("  -t INT         Use a pool of INT threads for decoding and encoding\n");
+    printf("  -X profile     Custom option sets.  Profiles:\n");
+    printf("      illumina   -P2 -R1.2 -B4\n");
+    printf("      pbccs      -P5 -R1.5 -B10\n");
+    printf("      hiseq      -P0 -R0 -b0-0=0,1-1=1,2-9=6,10-19=15,\\\n");
+    printf("                     20-24=2225-29=27,30-34=33,35-39=37,40-99=40\n");
+    printf("      novaseq    -P0 -R0 -b0-6=2,7-13=12,14-24=18,25-99=36\n");
     printf("  -v             Increase verbosity\n");
     exit(0);
 }
@@ -211,7 +219,7 @@ int main(int argc, char **argv) {
     gen_map(blevel); // default
 
     int c;
-    while ((c = getopt(argc, argv, "P:B:O:I:b:t:R:vk:")) >= 0) {
+    while ((c = getopt(argc, argv, "P:B:O:I:b:t:R:vk:X:")) >= 0) {
 	switch(c) {
 	case 'I': hts_parse_format(&in_fmt, optarg); break;
 	case 'O': hts_parse_format(&out_fmt, optarg); break;
@@ -235,6 +243,7 @@ int main(int argc, char **argv) {
 	case 'b':
 	    if (parse_map(optarg) < 0)
 		goto err;
+	    blevel = 99;
 	    break;
 
 	case 'B':
@@ -250,6 +259,33 @@ int main(int argc, char **argv) {
 	    }
 	    break;
 
+	case 'X':
+	    if (strcmp(optarg, "pbccs") == 0) {
+		// -P5 -R1.5 -B10
+		plevel = 5;
+		rlevel = 1.5;
+		gen_map(blevel = 10);
+	    } else if (strcmp(optarg, "illumina") == 0) {
+		// -P3 -R1.2 -B8
+		plevel = 3;
+		rlevel = 1.1;
+		gen_map(blevel = 8);
+	    } else if (strcmp(optarg, "hiseq") == 0) {
+		plevel = 0;
+		rlevel = 0;
+		parse_map("0-0=0,1-1=1,2-9=6,10-19=15,20-24=22,25-29=27,"
+			  "30-34=33,35-39=37,40-99=40");
+		blevel = 99;
+	    } else if (strcmp(optarg, "novaseq") == 0) {
+		plevel = 0;
+		rlevel = 0;
+		parse_map("0-6=2,7-13=12,14-24=18,25-99=36");
+		blevel = 99;
+	    } else {
+		fprintf(stderr, "Unknown profile \"%s\"\n", optarg);
+		exit(1);
+	    }
+	    break;
 	case '?':
 	default:
 	    usage();
