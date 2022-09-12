@@ -10,7 +10,7 @@ CC=gcc
 .c.o:
 	$(CC) -c $< -o $@ $(CFLAGS) $(CPPFLAGS)
 
-OBJS = main.o entropy.o
+OBJS = smooth.o entropy.o
 qual_smooth: $(OBJS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(OBJS) -o $@ $(LDFLAGS)
 
