@@ -1,3 +1,5 @@
+all: qual_smooth qual_train
+
 # NB: HTSLIB and HTSCODECS dirs are local source trees
 HTSLIB=/nfs/users/nfs_j/jkb/work/samtools_master/htslib
 HTSCODECS=/nfs/users/nfs_j/jkb/work/samtools_master/htscodecs
@@ -14,5 +16,8 @@ OBJS = smooth.o entropy.o
 qual_smooth: $(OBJS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(OBJS) -o $@ $(LDFLAGS)
 
+qual_train: train.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@ $(LDFLAGS)
+
 clean:
-	rm qual_smooth *.o
+	rm qual_smooth qual_train *.o
