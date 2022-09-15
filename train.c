@@ -42,7 +42,7 @@ too.
  * - Consider both strands
  * - Reverse complement too
  *   - Either aggregating by a canonical orientation
- *   - Or using the REVERSE flag to store in original BAM orientation
+ *   - (DONE) Or use the REVERSE flag to store in original BAM orientation
  */
 
 #include <stdio.h>
@@ -59,6 +59,12 @@ uint32_t (*kmer_count)[2] = NULL;
 #define WIN_SHIFT 2 // +ve => move right
 #define WIN_MASK ((1<<(3*WIN_LEN))-1)
 #define KMER_INIT (05555555555 & WIN_MASK);
+
+// Accumulate on orig seq strand only
+#define DO_REVERSE
+
+// Ignore indel cases, so match-pileups only
+#define MATCH_ONLY
 
 /*
  * Builds a mapping table of reference positions to consensus
@@ -145,11 +151,33 @@ static uint32_t context_i(bam1_t *b, int pos) {
     int len = b->core.l_qseq;
     uint32_t ctx = 0;
 
-    for (int i = 0, j = pos-WIN_LEN/2+WIN_SHIFT; i < WIN_LEN; i++, j++)
+    // FIXME: switch to two versions for reverse or orig rather than
+    // one vers and a second loop to reverse.
+
+#ifdef DO_REVERSE
+    int shift = (b->core.flag & BAM_FREVERSE) ? -WIN_SHIFT : WIN_SHIFT;
+#else
+    int shift = WIN_SHIFT;
+#endif
+    for (int i = 0, j = pos-WIN_LEN/2+shift; i < WIN_LEN; i++, j++)
 	ctx = (ctx<<3) | 
 	    (j >= 0 && j < len
 	     ? seq_nt16_int[bam_seqi(seq, j)]
 	     : 4);
+
+#ifdef DO_REVERSE
+    if (b->core.flag & BAM_FREVERSE) {
+	uint32_t ctx2 = 0;
+	//fprintf(stderr, "%05o ", ctx);
+	for (int i = 0; i < WIN_LEN; i++) {
+	    ctx2 = (ctx2<<3) | ((ctx & 7)^3);
+	    ctx >>= 3;
+	}
+	//fprintf(stderr, "%05o\n", ctx2);
+	ctx = ctx2;
+    }
+#endif
+
     return ctx;
 }
 
@@ -210,7 +238,9 @@ void accumulate_kmers(const uint8_t *ref, hts_pos_t *map, bam1_t *b) {
 		// Both seq and ref continue in sync.
 		if (islower(rbase)) {
 		    if (V) printf("dm %ld\t%c %c *\n", rpos, rbase, qbase);
-		    //kmer_count[kmer][0]++; // base vs cons-ins
+#ifndef MATCH_ONLY
+		    kmer_count[kmer][0]++; // base vs cons-ins
+#endif
 		} else {
 		    if (qbase == ambig(rbase, qbase)) {
 			if (V>1)
@@ -219,7 +249,9 @@ void accumulate_kmers(const uint8_t *ref, hts_pos_t *map, bam1_t *b) {
 		    } else if (rbase == '*') {
 			if (V)
 			    printf("im %ld\t%c %c *\n", rpos, rbase, qbase);
-			//kmer_count[kmer][0]++; // ins vs cons-del
+#ifndef MATCH_ONLY
+			kmer_count[kmer][0]++; // ins vs cons-del
+#endif
 		    } else if (rbase != 'N') {
 			if (V) {
 			    if (V<2)
@@ -241,10 +273,14 @@ void accumulate_kmers(const uint8_t *ref, hts_pos_t *map, bam1_t *b) {
 	    case BAM_CINS:
 		if (islower(rbase)) {
 		    if (V>1) printf("mi %ld\t%c %c\n", rpos, rbase, qbase);
-		    //kmer_count[kmer][1]++; // ins matching cons-ins
+#ifndef MATCH_ONLY
+		    kmer_count[kmer][1]++; // ins matching cons-ins
+#endif
 		} else {
 		    if (V) printf("I  %ld\t. %c *\n", rpos, qbase);
-		    //kmer_count[kmer][0]++; // ins vs cons
+#ifndef MATCH_ONLY
+		    kmer_count[kmer][0]++; // ins vs cons
+#endif
 		}
 		qpos++;
 		nth++;
@@ -253,10 +289,14 @@ void accumulate_kmers(const uint8_t *ref, hts_pos_t *map, bam1_t *b) {
 	    case BAM_CDEL:
 		if (rbase == '*') {
 		    if (V>1) printf("md %ld\t%c .\n", rpos, rbase);
-		    //kmer_count[kmer][1]++; // del matching cons-del
+#ifndef MATCH_ONLY
+		    kmer_count[kmer][1]++; // del matching cons-del
+#endif
 		} else {
 		    if (V) printf("D  %ld\t%c . *\n", rpos, rbase);
-		    //kmer_count[kmer][0]++; // del vs cons-base
+#ifndef MATCH_ONLY
+		    kmer_count[kmer][0]++; // del vs cons-base
+#endif
 		}
 		rpos++;
 		break;
@@ -277,7 +317,7 @@ void dump_kmers(void) {
 	    continue;
 
 	for (j = WIN_LEN-1; j >= 0; j--)
-	    putchar("ACGTN---"[(i>>(j*3))&7]);
+	    putchar("ACGTNNNN"[(i>>(j*3))&7]);
 	double err = cnt ? (double)kmer_count[i][0] / cnt : 0;
 	int qval = err ? -10*log10(err)+.5 : 99;
 	printf("\t%d\t%d\t%d\n", kmer_count[i][0], kmer_count[i][1], qval);
