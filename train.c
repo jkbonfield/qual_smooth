@@ -95,6 +95,8 @@ uint8_t ambig(uint8_t ref, uint8_t query) {
  * if it gives a better discrimination in quality scores.
  */
 void accumulate_kmers(const uint8_t *ref, hts_pos_t *map, bam1_t *b) {
+    int V=1;
+
     static uint8_t L[256], L_done = 0;
     if (!L_done) {
 	memset(L, 4, 256);
@@ -114,6 +116,7 @@ void accumulate_kmers(const uint8_t *ref, hts_pos_t *map, bam1_t *b) {
     int cig_op = 0, cig_len = 0, cig_idx = 0;
     int nth = 0; // nth base in an insertion
     int diff_type = 0;
+    hts_pos_t diff_pos = 0;
 
     //printf("New seq at %ld\n", pos);
     uint32_t qkmer = 0, rkmer = 0, diff_in = 0;
@@ -123,7 +126,6 @@ void accumulate_kmers(const uint8_t *ref, hts_pos_t *map, bam1_t *b) {
 	qkmer = qkmer*8 + seq_nt16_int[bam_seqi(qseq, i)];
 	qkmer = qkmer & WIN_MASK;
 	kmer_skip -= kmer_skip>0;
-	int valid = 1;
 
     next_op:
 	if (cig_len == 0) {
@@ -134,14 +136,14 @@ void accumulate_kmers(const uint8_t *ref, hts_pos_t *map, bam1_t *b) {
 	    cig_len = bam_cigar_oplen(cig[cig_idx]);
 	    cig_op  = bam_cigar_op(cig[cig_idx]);
 	    cig_idx++;
-	    printf("CIG: %d %c\n", cig_len, BAM_CIGAR_STR[cig_op]);
+	    if(V)printf("CIG: %d %c\n", cig_len, BAM_CIGAR_STR[cig_op]);
 	    if (cig_op == BAM_CINS)
 		pos--, nth = 1; // ins after last base, not before this
 	    else
 		nth = 0;
 	}
 
-	printf("%d %c%c%c\t", i, qbase, ref[map[pos]+nth],
+	if(V)printf("%d %c%c%c\t", i, qbase, ref[map[pos]+nth],
 	    ambig(ref[map[pos]+nth], qbase));
 	if (bam_cigar_type(cig_op) == 2) {
 	    // Consumes ref only
@@ -149,29 +151,38 @@ void accumulate_kmers(const uint8_t *ref, hts_pos_t *map, bam1_t *b) {
 		uint8_t rbase = ambig(ref[map[pos++]], qbase);
 		if (rbase == '*') {
 		    // deletion in consensus too, so ignore
-		    break; // ?
 		} else {
 		    rkmer = rkmer*8 + L[rbase];
 		    rkmer = rkmer & WIN_MASK;
+		    if (!diff_in && !kmer_skip) {
+			diff_in = WIN_LEN/2;
+			diff_type = 'D';
+			diff_pos = pos;
+		    }
 		}
-		printf("(D)\t%05o\t%05o\t%d\n", qkmer, rkmer, kmer_skip);
-		// Even if [qr]kner matches, it's something to log
-		valid = 0;
+		if(V)printf("(D)\t%05o\t%05o\t%d%s\n", qkmer, rkmer, kmer_skip,
+		       rbase == '*' ? "" : " *");
 	    } while (--cig_len > 0);
-	    cig_len++;
-	    //goto next_op;
+	    //cig_len++;
+	    goto next_op;
 	} else if (bam_cigar_type(cig_op) & 2) {
 	    // Consumes both ref and query
 	    uint8_t rbase = ambig(ref[map[pos++]], qbase);
 	    rkmer = rkmer*8 + L[rbase];
 	    rkmer = rkmer & WIN_MASK;
-	    printf("M\t%05o\t%05o\t%d\n", qkmer, rkmer, kmer_skip);
+	    if(V)printf("M\t%05o\t%05o\t%d%s\n", qkmer, rkmer, kmer_skip,
+		   qkmer == rkmer ? "" : " *");
+	    if (qkmer != rkmer && !diff_in && !kmer_skip) {
+		diff_in = WIN_LEN/2+1;
+		diff_type = 'M';
+		diff_pos = pos;
+	    }
 	} else if (bam_cigar_type(cig_op) & 1) {
 	    // Consumes seq only
 	    // If soft-clip, not an cons diff
 	    // If insertion, it's a difference unless cons has lowercase
 	    if (cig_op == BAM_CSOFT_CLIP) {
-		printf("S\t%05o\t%05o\t%d\n", qkmer, rkmer, kmer_skip);
+		if(V)printf("S\t%05o\t%05o\t%d\n", qkmer, rkmer, kmer_skip);
 		i+=cig_len-1;
 		cig_len -= cig_len-1;
 		kmer_skip = WIN_LEN;
@@ -180,11 +191,14 @@ void accumulate_kmers(const uint8_t *ref, hts_pos_t *map, bam1_t *b) {
 		    uint8_t rbase = ref[map[pos]+nth++];
 		    rkmer = rkmer*8 + L[rbase];
 		    rkmer = rkmer & WIN_MASK;
-		    printf("i\t%05o\t%05o\t%d\n", qkmer, rkmer, kmer_skip);
+		    if(V)printf("i\t%05o\t%05o\t%d\n", qkmer, rkmer, kmer_skip);
 		} else {
-		    printf("I\t%05o\t%05o\t%d\n", qkmer, rkmer, kmer_skip);
-		    valid = 0;
-		    //kmer_skip++;
+		    if(V)printf("I\t%05o\t%05o\t%d *\n", qkmer, rkmer, kmer_skip);
+		    if (!diff_in && !kmer_skip) {
+			diff_in = WIN_LEN/2+cig_len;
+			diff_type = 'I';
+			diff_pos = pos+1;
+		    }
 		}
 		if (cig_len == 1) pos++; // correct for pos-- above
 	    }
@@ -208,51 +222,21 @@ void accumulate_kmers(const uint8_t *ref, hts_pos_t *map, bam1_t *b) {
 	// CCGAG CCGAG Y
 	if (!kmer_skip) {
 	    //kmer_count[qkmer][qkmer==rkmer]++;
-	    if (qkmer == rkmer && valid) {
+	    if (diff_in == 0) {
 		kmer_count[qkmer][1]++;
+	    } else if (diff_in == 1) {
+		if(V)printf("Diff %ld %c %05o\n", diff_pos, diff_type, qkmer);
+		kmer_count[qkmer][0]++;
+		kmer_skip = WIN_LEN/2+1;
+		diff_in--;
 	    } else {
-		if (!diff_type) diff_type = BAM_CIGAR_STR[cig_op];
-		if (diff_in > 1) {
-		    diff_in--;
-		    printf("Delay1\n");
-		} else if (diff_in == 1) {
-//		if (((qkmer >> 3*(WIN_LEN/2)) & 7) !=
-//		     ((rkmer >> 3*(WIN_LEN/2)) & 7)) {
-		    printf("Diff %c %05o\n", diff_type, qkmer);
-		    kmer_count[qkmer][0]++;
-		    kmer_skip += WIN_LEN/2+1;
-		    diff_in = 0;
-		    diff_type = 0;
-		} else {
-		    printf("Delay0\n");
-		    diff_in = WIN_LEN/2;
-		}
+		diff_in--;
+		if(V)printf("Delay %d\n", diff_in);
 	    }
 	} else {
-	    printf("Skip %d\n", kmer_skip);
+	    if(V)printf("Skip %d\n", kmer_skip);
 	}
-//	if (qkmer != rkmer)
-//	    printf("Diff\n");
 	cig_len--;
-
-/*
-	switch (cig_op) {
-	case BAM_CMATCH:
-	case BAM_CEQUAL:
-	case BAM_CBACK:
-	    
-	}
-*/
-
-/*
-	if (bam_cigar_type(cig_op) & 1) {
-	    // consumes query
-	}
-	if (bam_cigar_type(cig_op) & 2) {
-	    // consumes reference
-	}
-	// if neither loop for next cigar?
-*/
     }
 }
 
