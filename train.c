@@ -1,4 +1,30 @@
 /*
+Notes:
+
+Use a self-built consensus (eg samtools consensus, crumble) instead of
+a truth set.
+
+Eg GIAB HG002 chr1 claims:
+
+chr1    4376297 .       G       T       50      PASS    ...
+chr1    4376333 .       A       G       50      PASS    ...
+chr1    4376342 .       T       G       50      PASS    ...
+
+These are all visible in the data set and due to long reads are all
+phased together.  However chr1 4376225 also has a SNP which is phased
+with the other 3 above and not called.  Consequentially it's labelled
+as 3 mismatches.  (It is however missing from the bed file, but it
+casts doubt on the completeness of some calls.)
+
+We may be better producing an overly optimistic het consensus call
+with confidence, so confident not-het is evaluated, confident is-het
+is evaluated, and anything inbetween is skipped.  This means we could
+self-train on a denovo data set using the errors in "obvious" regions
+to tell us something about the error rates in less obvious regions
+too.
+*/
+
+/*
  * Given a corrected reference (eg "bcftools consensus" on a VCF truth
  * set), this compares alignments in BAM et al to group sequence and quality
  * into correct and incorrect, permitting kmer based recalibration of
@@ -14,6 +40,9 @@
  * TODO:
  * - Add bed filter regions too.
  * - Consider both strands
+ * - Reverse complement too
+ *   - Either aggregating by a canonical orientation
+ *   - Or using the REVERSE flag to store in original BAM orientation
  */
 
 #include <stdio.h>
@@ -26,7 +55,8 @@
 #include <htslib/thread_pool.h>
 
 uint32_t (*kmer_count)[2] = NULL;
-#define WIN_LEN 5 // FIXME: needs to be centred
+#define WIN_LEN 5
+#define WIN_SHIFT 2 // +ve => move right
 #define WIN_MASK ((1<<(3*WIN_LEN))-1)
 #define KMER_INIT (05555555555 & WIN_MASK);
 
@@ -94,8 +124,37 @@ uint8_t ambig(uint8_t ref, uint8_t query) {
  * This also permits us to aggregate many longer kmers into smaller kmers
  * if it gives a better discrimination in quality scores.
  */
+static char *context_s(bam1_t *b, int pos) {
+    static char ctx[WIN_LEN+1] = {0};
+    uint8_t *seq = bam_get_seq(b);
+    int len = b->core.l_qseq;
+
+    for (int i = 0, j = pos-WIN_LEN/2+WIN_SHIFT; i < WIN_LEN; i++, j++)
+	ctx[i] = j >= 0 && j < len
+	    ? seq_nt16_str[bam_seqi(seq, j)]
+	    : 'N';
+
+    return ctx;
+}
+
+// ACGTN -> {0..4}, 3 bits at a time.
+// NOTE: this could be more efficient via a rolling kmer rather than
+// recomputing it every time.  This is here for simplicity currently.
+static uint32_t context_i(bam1_t *b, int pos) {
+    uint8_t *seq = bam_get_seq(b);
+    int len = b->core.l_qseq;
+    uint32_t ctx = 0;
+
+    for (int i = 0, j = pos-WIN_LEN/2+WIN_SHIFT; i < WIN_LEN; i++, j++)
+	ctx = (ctx<<3) | 
+	    (j >= 0 && j < len
+	     ? seq_nt16_int[bam_seqi(seq, j)]
+	     : 4);
+    return ctx;
+}
+
 void accumulate_kmers(const uint8_t *ref, hts_pos_t *map, bam1_t *b) {
-    int V=1;
+    const int V=0;
 
     static uint8_t L[256], L_done = 0;
     if (!L_done) {
@@ -109,134 +168,103 @@ void accumulate_kmers(const uint8_t *ref, hts_pos_t *map, bam1_t *b) {
 	kmer_count = calloc(WIN_MASK+1, sizeof(*kmer_count));
     }
 
-    hts_pos_t pos = b->core.pos;
+    hts_pos_t rpos = b->core.pos; // ref pos; cons pos = map[rpos]
+    hts_pos_t qpos = 0;           // query pos
     uint32_t *cig = bam_get_cigar(b);
     uint8_t *qseq = bam_get_seq(b);
-    int ncig = b->core.n_cigar, i = 0;
-    int cig_op = 0, cig_len = 0, cig_idx = 0;
-    int nth = 0; // nth base in an insertion
-    int diff_type = 0;
-    hts_pos_t diff_pos = 0;
+    uint8_t *qual = bam_get_qual(b);
+    int ncig = b->core.n_cigar;
 
-    //printf("New seq at %ld\n", pos);
-    uint32_t qkmer = 0, rkmer = 0, diff_in = 0;
-    int kmer_skip = WIN_LEN;
-    for (i = 0; i < b->core.l_qseq; i++) {
-	uint8_t qbase = seq_nt16_str[bam_seqi(qseq, i)];
-	qkmer = qkmer*8 + seq_nt16_int[bam_seqi(qseq, i)];
-	qkmer = qkmer & WIN_MASK;
-	kmer_skip -= kmer_skip>0;
+    if (V) printf("SEQ %s\n", bam_get_qname(b));
+    for (int i = 0; i < ncig; i++) {
+	int cig_op = bam_cigar_op(cig[i]);
+	int cig_len = bam_cigar_oplen(cig[i]);
+	int nth = 0;
 
-    next_op:
-	if (cig_len == 0) {
-	    if (cig_idx >= ncig) {
-		fprintf(stderr, "Malformed CIGAR string\n");
-		return;
-	    }
-	    cig_len = bam_cigar_oplen(cig[cig_idx]);
-	    cig_op  = bam_cigar_op(cig[cig_idx]);
-	    cig_idx++;
-	    if(V)printf("CIG: %d %c\n", cig_len, BAM_CIGAR_STR[cig_op]);
-	    if (cig_op == BAM_CINS)
-		pos--, nth = 1; // ins after last base, not before this
-	    else
-		nth = 0;
-	}
+	if (V>1) printf("> %d%c\n", cig_len, BAM_CIGAR_STR[cig_op]);
 
-	if(V)printf("%d %c%c%c\t", i, qbase, ref[map[pos]+nth],
-	    ambig(ref[map[pos]+nth], qbase));
-	if (bam_cigar_type(cig_op) == 2) {
-	    // Consumes ref only
-	    do {
-		uint8_t rbase = ambig(ref[map[pos++]], qbase);
+	if (bam_cigar_type(cig_op) == 0)
+	    // Consumes neither seq or ref
+	    continue;
+
+	if (cig_op == BAM_CINS)
+	    rpos--, nth = 1; // ins after last last, not before next
+
+	for (int j = 0; j < cig_len; j++) {
+	    uint8_t qbase = seq_nt16_str[bam_seqi(qseq, qpos)];
+	    uint8_t rbase = ref[map[rpos]+nth];
+
+	    uint32_t kmer = context_i(b, qpos);
+	    if (V>1) printf("%.5s\t%05o\t", context_s(b, qpos), kmer);
+
+	    switch (cig_op) {
+	    case BAM_CSOFT_CLIP:
+		// Seq only, just ignore
+		if (V>1) printf("S %ld\t. %c\n", rpos, qbase);
+		qpos++;
+		break;
+
+	    case BAM_CMATCH:
+	    case BAM_CDIFF:
+	    case BAM_CEQUAL:
+		// Both seq and ref continue in sync.
+		if (islower(rbase)) {
+		    if (V) printf("dm %ld\t%c %c *\n", rpos, rbase, qbase);
+		    //kmer_count[kmer][0]++; // base vs cons-ins
+		} else {
+		    if (qbase == ambig(rbase, qbase)) {
+			if (V>1)
+			    printf("M  %ld\t%c %c\n", rpos, rbase, qbase);
+			kmer_count[kmer][1]++;
+		    } else if (rbase == '*') {
+			if (V)
+			    printf("im %ld\t%c %c *\n", rpos, rbase, qbase);
+			//kmer_count[kmer][0]++; // ins vs cons-del
+		    } else if (rbase != 'N') {
+			if (V) {
+			    if (V<2)
+				printf("%.5s\t%05o\t", context_s(b, qpos), kmer);
+			    printf("X  %ld\t%c %c %d *\n", rpos, rbase, qbase, qual[qpos]);
+			}
+			kmer_count[kmer][0]++; // mismatch
+		    }
+		}
+
+		// TODO:
+		// Check if map[rpos] and map[rpos+1] are more than 1 apart,
+		// indicating insertion in cons which is absent in seq.
+
+		qpos++;
+		rpos++;
+		break;
+
+	    case BAM_CINS:
+		if (islower(rbase)) {
+		    if (V>1) printf("mi %ld\t%c %c\n", rpos, rbase, qbase);
+		    //kmer_count[kmer][1]++; // ins matching cons-ins
+		} else {
+		    if (V) printf("I  %ld\t. %c *\n", rpos, qbase);
+		    //kmer_count[kmer][0]++; // ins vs cons
+		}
+		qpos++;
+		nth++;
+		break;
+
+	    case BAM_CDEL:
 		if (rbase == '*') {
-		    // deletion in consensus too, so ignore
+		    if (V>1) printf("md %ld\t%c .\n", rpos, rbase);
+		    //kmer_count[kmer][1]++; // del matching cons-del
 		} else {
-		    rkmer = rkmer*8 + L[rbase];
-		    rkmer = rkmer & WIN_MASK;
-		    if (!diff_in && !kmer_skip) {
-			diff_in = WIN_LEN/2;
-			diff_type = 'D';
-			diff_pos = pos;
-		    }
+		    if (V) printf("D  %ld\t%c . *\n", rpos, rbase);
+		    //kmer_count[kmer][0]++; // del vs cons-base
 		}
-		if(V)printf("(D)\t%05o\t%05o\t%d%s\n", qkmer, rkmer, kmer_skip,
-		       rbase == '*' ? "" : " *");
-	    } while (--cig_len > 0);
-	    //cig_len++;
-	    goto next_op;
-	} else if (bam_cigar_type(cig_op) & 2) {
-	    // Consumes both ref and query
-	    uint8_t rbase = ambig(ref[map[pos++]], qbase);
-	    rkmer = rkmer*8 + L[rbase];
-	    rkmer = rkmer & WIN_MASK;
-	    if(V)printf("M\t%05o\t%05o\t%d%s\n", qkmer, rkmer, kmer_skip,
-		   qkmer == rkmer ? "" : " *");
-	    if (qkmer != rkmer && !diff_in && !kmer_skip) {
-		diff_in = WIN_LEN/2+1;
-		diff_type = 'M';
-		diff_pos = pos;
+		rpos++;
+		break;
 	    }
-	} else if (bam_cigar_type(cig_op) & 1) {
-	    // Consumes seq only
-	    // If soft-clip, not an cons diff
-	    // If insertion, it's a difference unless cons has lowercase
-	    if (cig_op == BAM_CSOFT_CLIP) {
-		if(V)printf("S\t%05o\t%05o\t%d\n", qkmer, rkmer, kmer_skip);
-		i+=cig_len-1;
-		cig_len -= cig_len-1;
-		kmer_skip = WIN_LEN;
-	    } else {
-		if (islower(ref[map[pos]+nth])) {
-		    uint8_t rbase = ref[map[pos]+nth++];
-		    rkmer = rkmer*8 + L[rbase];
-		    rkmer = rkmer & WIN_MASK;
-		    if(V)printf("i\t%05o\t%05o\t%d\n", qkmer, rkmer, kmer_skip);
-		} else {
-		    if(V)printf("I\t%05o\t%05o\t%d *\n", qkmer, rkmer, kmer_skip);
-		    if (!diff_in && !kmer_skip) {
-			diff_in = WIN_LEN/2+cig_len;
-			diff_type = 'I';
-			diff_pos = pos+1;
-		    }
-		}
-		if (cig_len == 1) pos++; // correct for pos-- above
-	    }
-	} else {
-	    // Consumes neither - not aligned so just skip
-	    // TODO: may want to clear qkmer to have Ns here?
 	}
 
-	// If we have a single bp difference, do we want to only
-	// count it as an error when the diff is the middle base (and
-	// not count as valid for the others). Ie
-	//
-	// AACCG AACCG Y
-	// ACCGT ACCGT Y
-	// CCGTA CCGTT ignore
-	// CGTAA CGTTA ignore
-	// GTAAC GTTAC N
-	// TAACC TTACC ignore
-	// AACCG TACCG ignore
-	// ACCGA ACCGA Y
-	// CCGAG CCGAG Y
-	if (!kmer_skip) {
-	    //kmer_count[qkmer][qkmer==rkmer]++;
-	    if (diff_in == 0) {
-		kmer_count[qkmer][1]++;
-	    } else if (diff_in == 1) {
-		if(V)printf("Diff %ld %c %05o\n", diff_pos, diff_type, qkmer);
-		kmer_count[qkmer][0]++;
-		kmer_skip = WIN_LEN/2+1;
-		diff_in--;
-	    } else {
-		diff_in--;
-		if(V)printf("Delay %d\n", diff_in);
-	    }
-	} else {
-	    if(V)printf("Skip %d\n", kmer_skip);
-	}
-	cig_len--;
+	if (cig_op == BAM_CINS)
+	    rpos++; // undo pos-- above
     }
 }
 
@@ -244,13 +272,6 @@ void dump_kmers(void) {
     int i, j;
     puts("=== kmers ===\n");
     for (i = 0; i <= WIN_MASK; i++) {
-//	int valid = 1;
-//	for (j = 0; j < WIN_LEN; j++)
-//	    if (((i>>(j*3))&7) > 4)
-//		valid = 0;
-//	if (!valid)
-//	    continue;
-
 	int cnt = kmer_count[i][0]+kmer_count[i][1];
 	if (!cnt)
 	    continue;
@@ -259,8 +280,7 @@ void dump_kmers(void) {
 	    putchar("ACGTN---"[(i>>(j*3))&7]);
 	double err = cnt ? (double)kmer_count[i][0] / cnt : 0;
 	int qval = err ? -10*log10(err)+.5 : 99;
-	printf("\t%d\t%d\t%d\t%d\n", kmer_count[i][0]+kmer_count[i][1],
-	       kmer_count[i][0], kmer_count[i][1], qval);
+	printf("\t%d\t%d\t%d\n", kmer_count[i][0], kmer_count[i][1], qval);
     }
 }
 
@@ -279,7 +299,7 @@ int main(int argc, char **argv) {
 	case 'I': hts_parse_format(&in_fmt, optarg); break;
 	case 'f': {
 	    if (!(fai = fai_load(optarg))) {
-		fprintf(stderr, "Failed to load consensus fasta");
+		fprintf(stderr, "Failed to load consensus fasta\n");
 		goto err;
 	    }
 	    break;
