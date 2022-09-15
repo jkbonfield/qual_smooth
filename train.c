@@ -54,17 +54,26 @@ too.
 #include <htslib/faidx.h>
 #include <htslib/thread_pool.h>
 
-uint32_t (*kmer_count)[2] = NULL;
+uint32_t (*kmer_count)[3][2] = NULL;
 #define WIN_LEN 5
-#define WIN_SHIFT 2 // +ve => move right
+#define WIN_SHIFT 0 // +ve => move right
 #define WIN_MASK ((1<<(3*WIN_LEN))-1)
 #define KMER_INIT (05555555555 & WIN_MASK);
 
-// Accumulate on orig seq strand only
+// Put kmer mismatch, ins and del into own stats
+#define KMAT 0
+#define KINS 1
+#define KDEL 2
+
+// Accumulate on orig seq strand only.
+//
+// This may not be as useful as it sounds as gaps during alignment get
+// left justified regardless of orientations.  It works OK for mismatches
+// though.
 #define DO_REVERSE
 
 // Ignore indel cases, so match-pileups only
-#define MATCH_ONLY
+//#define MATCH_ONLY
 
 /*
  * Builds a mapping table of reference positions to consensus
@@ -239,18 +248,18 @@ void accumulate_kmers(const uint8_t *ref, hts_pos_t *map, bam1_t *b) {
 		if (islower(rbase)) {
 		    if (V) printf("dm %ld\t%c %c *\n", rpos, rbase, qbase);
 #ifndef MATCH_ONLY
-		    kmer_count[kmer][0]++; // base vs cons-ins
+		    kmer_count[kmer][KDEL][0]++; // base vs cons-ins
 #endif
 		} else {
 		    if (qbase == ambig(rbase, qbase)) {
 			if (V>1)
 			    printf("M  %ld\t%c %c\n", rpos, rbase, qbase);
-			kmer_count[kmer][1]++;
+			kmer_count[kmer][KMAT][1]++;
 		    } else if (rbase == '*') {
 			if (V)
 			    printf("im %ld\t%c %c *\n", rpos, rbase, qbase);
 #ifndef MATCH_ONLY
-			kmer_count[kmer][0]++; // ins vs cons-del
+			kmer_count[kmer][KINS][0]++; // ins vs cons-del
 #endif
 		    } else if (rbase != 'N') {
 			if (V) {
@@ -258,7 +267,7 @@ void accumulate_kmers(const uint8_t *ref, hts_pos_t *map, bam1_t *b) {
 				printf("%.5s\t%05o\t", context_s(b, qpos), kmer);
 			    printf("X  %ld\t%c %c %d *\n", rpos, rbase, qbase, qual[qpos]);
 			}
-			kmer_count[kmer][0]++; // mismatch
+			kmer_count[kmer][KMAT][0]++; // mismatch
 		    }
 		}
 
@@ -274,12 +283,12 @@ void accumulate_kmers(const uint8_t *ref, hts_pos_t *map, bam1_t *b) {
 		if (islower(rbase)) {
 		    if (V>1) printf("mi %ld\t%c %c\n", rpos, rbase, qbase);
 #ifndef MATCH_ONLY
-		    kmer_count[kmer][1]++; // ins matching cons-ins
+		    kmer_count[kmer][KINS][1]++; // ins matching cons-ins
 #endif
 		} else {
 		    if (V) printf("I  %ld\t. %c *\n", rpos, qbase);
 #ifndef MATCH_ONLY
-		    kmer_count[kmer][0]++; // ins vs cons
+		    kmer_count[kmer][KINS][0]++; // ins vs cons
 #endif
 		}
 		qpos++;
@@ -290,12 +299,12 @@ void accumulate_kmers(const uint8_t *ref, hts_pos_t *map, bam1_t *b) {
 		if (rbase == '*') {
 		    if (V>1) printf("md %ld\t%c .\n", rpos, rbase);
 #ifndef MATCH_ONLY
-		    kmer_count[kmer][1]++; // del matching cons-del
+		    kmer_count[kmer][KDEL][1]++; // del matching cons-del
 #endif
 		} else {
 		    if (V) printf("D  %ld\t%c . *\n", rpos, rbase);
 #ifndef MATCH_ONLY
-		    kmer_count[kmer][0]++; // del vs cons-base
+		    kmer_count[kmer][KDEL][0]++; // del vs cons-base
 #endif
 		}
 		rpos++;
@@ -309,18 +318,49 @@ void accumulate_kmers(const uint8_t *ref, hts_pos_t *map, bam1_t *b) {
 }
 
 void dump_kmers(void) {
-    int i, j;
+    int i, j, k;
     puts("=== kmers ===\n");
     for (i = 0; i <= WIN_MASK; i++) {
-	int cnt = kmer_count[i][0]+kmer_count[i][1];
+	int cnt =
+	    kmer_count[i][0][0]+kmer_count[i][0][1] +
+	    kmer_count[i][1][0]+kmer_count[i][1][1] +
+	    kmer_count[i][2][0]+kmer_count[i][2][1];
 	if (!cnt)
 	    continue;
 
+	int all_mis = 0;
+	for (k = 0; k < 3; k++) {
+#if 0
+	    // Should we set cnt to kmer_count[i][0..3][0..1] instead
+	    // of just kmer_count[i][k][0..1]?
+	    //
+	    // Ie ins err is #wrong-ins-with-this-kmer vs all
+	    // #correct-calls-with-this-kmer?
+	    //
+	    // I think yes, as AAAAA gets called 888 wrong, 0 correct,
+	    // simply because we see lots of overcalls but aren't counting
+	    // all the cases we didn't overcall.
+	    int cnt = kmer_count[i][k][0]+kmer_count[i][k][1];
+	    if (!cnt)
+		continue;
+#endif
+
+	    for (j = WIN_LEN-1; j >= 0; j--)
+		putchar("ACGTNNNN"[(i>>(j*3))&7]);
+	    double err = cnt ? (double)kmer_count[i][k][0] / cnt : 0;
+	    int qval = err ? -10*log10(err)+.5 : 99;
+	    printf("\t%c\t%d\t%d\t%d\n",
+		   "MID"[k], kmer_count[i][k][0], cnt, qval);
+
+	    all_mis += kmer_count[i][k][0];
+	}
+
+	// Combined stats
 	for (j = WIN_LEN-1; j >= 0; j--)
 	    putchar("ACGTNNNN"[(i>>(j*3))&7]);
-	double err = cnt ? (double)kmer_count[i][0] / cnt : 0;
+	double err = all_mis ? (double)all_mis / cnt : 0;
 	int qval = err ? -10*log10(err)+.5 : 99;
-	printf("\t%d\t%d\t%d\n", kmer_count[i][0], kmer_count[i][1], qval);
+	printf("\t?\t%d\t%d\t%d\n", all_mis, cnt, qval);
     }
 }
 
