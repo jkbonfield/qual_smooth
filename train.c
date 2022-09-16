@@ -39,10 +39,18 @@ too.
  *
  * TODO:
  * - Add bed filter regions too.
- * - Consider both strands
+ *
  * - Reverse complement too
  *   - Either aggregating by a canonical orientation
  *   - (DONE) Or use the REVERSE flag to store in original BAM orientation
+ *
+ * - Auto-build a hom/het consensus instead of relying on a truth set.
+ *   Like Crumble, we could ignore unknown data and concentrate on clear
+ *   hom/het/indel positions.
+ *
+ * - How to handle heterozygous insertions.  Bcftools consensus has no
+ *   ambiguity code to represent this?  Samtools consensus uses lowercase,
+ *   but then we need an alternative mechanism for cons->ref coord mapping.
  */
 
 #include <stdio.h>
@@ -75,6 +83,10 @@ uint32_t (*kmer_count)[3][2] = NULL;
 // Ignore indel cases, so match-pileups only
 //#define MATCH_ONLY
 
+// // Discount columns within NEIGHBOUR distance of a previous one
+// // TODO
+// #define NEIGHBOUR 0
+
 /*
  * Builds a mapping table of reference positions to consensus
  * positions:  map[ref_pos] = cons_pos.
@@ -83,7 +95,7 @@ uint32_t (*kmer_count)[3][2] = NULL;
  * * = deletion
  */
 hts_pos_t *build_ref_map(const uint8_t *ref, hts_pos_t len) {
-    hts_pos_t *map = malloc(len * sizeof(*map));
+    hts_pos_t *map = malloc((len+1) * sizeof(*map));
     if (!map)
 	return NULL;
 
@@ -93,6 +105,7 @@ hts_pos_t *build_ref_map(const uint8_t *ref, hts_pos_t len) {
 	if (ref[i] == '*' || isupper(ref[i]))
 	    map[r++] = i;
     }
+    map[r] = i; // so we can compare map[pos] with map[pos+1] to find ins
     return map;
 }
 
@@ -190,8 +203,8 @@ static uint32_t context_i(bam1_t *b, int pos) {
     return ctx;
 }
 
-void accumulate_kmers(const uint8_t *ref, hts_pos_t *map, bam1_t *b) {
-    const int V=0;
+void accumulate_kmers(const uint8_t *ref, hts_pos_t *map, bam1_t *b) { 
+    const int V=0; // DEBUG only
 
     static uint8_t L[256], L_done = 0;
     if (!L_done) {
@@ -206,7 +219,7 @@ void accumulate_kmers(const uint8_t *ref, hts_pos_t *map, bam1_t *b) {
     }
 
     hts_pos_t rpos = b->core.pos; // ref pos; cons pos = map[rpos]
-    hts_pos_t qpos = 0;           // query pos
+    int qpos = 0;                 // query pos
     uint32_t *cig = bam_get_cigar(b);
     uint8_t *qseq = bam_get_seq(b);
     uint8_t *qual = bam_get_qual(b);
@@ -271,9 +284,15 @@ void accumulate_kmers(const uint8_t *ref, hts_pos_t *map, bam1_t *b) {
 		    }
 		}
 
-		// TODO:
 		// Check if map[rpos] and map[rpos+1] are more than 1 apart,
 		// indicating insertion in cons which is absent in seq.
+		if (map[rpos+1] - map[rpos] != 1) {
+		    if (V)
+			printf("mD %ld\t. %c *\n", rpos,  qbase);
+#ifndef MATCH_ONLY
+		    kmer_count[kmer][KDEL][0]++; // ins in cons, absent here
+#endif
+		}
 
 		qpos++;
 		rpos++;
@@ -281,10 +300,20 @@ void accumulate_kmers(const uint8_t *ref, hts_pos_t *map, bam1_t *b) {
 
 	    case BAM_CINS:
 		if (islower(rbase)) {
-		    if (V>1) printf("mi %ld\t%c %c\n", rpos, rbase, qbase);
+		    // TODO: also check base matches
+		    if (qbase == ambig(rbase, qbase)) {
+			if (V>1) printf("mi %ld\t%c %c\n", rpos, rbase, qbase);
 #ifndef MATCH_ONLY
-		    kmer_count[kmer][KINS][1]++; // ins matching cons-ins
+			// Actually [KMAT][1]
+			kmer_count[kmer][KINS][1]++; // ins matching cons-ins
 #endif
+		    } else {
+			if (V>1) printf("xi %ld\t%c %c\n", rpos, rbase, qbase);
+#ifndef MATCH_ONLY
+			// Maybe [KMAT][0]?
+			kmer_count[kmer][KINS][0]++; // mismatching cons-ins
+#endif
+		    }
 		} else {
 		    if (V) printf("I  %ld\t. %c *\n", rpos, qbase);
 #ifndef MATCH_ONLY
@@ -321,6 +350,13 @@ void dump_kmers(void) {
     int i, j, k;
     puts("=== kmers ===\n");
     for (i = 0; i <= WIN_MASK; i++) {
+	// We record INS here vs INS cons as a valid INS,
+	// but logically this is really a "match" (or mismatch) state.
+	// Hence we use the total count across all types rather than just
+	// the specific one for this type.  Hence we could possibly
+	// combine all "pass" states into a single count during analysis
+	// and only have "fail" states for the separate types, but this is
+	// left to future exploration.
 	int cnt =
 	    kmer_count[i][0][0]+kmer_count[i][0][1] +
 	    kmer_count[i][1][0]+kmer_count[i][1][1] +
@@ -330,21 +366,6 @@ void dump_kmers(void) {
 
 	int all_mis = 0;
 	for (k = 0; k < 3; k++) {
-#if 0
-	    // Should we set cnt to kmer_count[i][0..3][0..1] instead
-	    // of just kmer_count[i][k][0..1]?
-	    //
-	    // Ie ins err is #wrong-ins-with-this-kmer vs all
-	    // #correct-calls-with-this-kmer?
-	    //
-	    // I think yes, as AAAAA gets called 888 wrong, 0 correct,
-	    // simply because we see lots of overcalls but aren't counting
-	    // all the cases we didn't overcall.
-	    int cnt = kmer_count[i][k][0]+kmer_count[i][k][1];
-	    if (!cnt)
-		continue;
-#endif
-
 	    for (j = WIN_LEN-1; j >= 0; j--)
 		putchar("ACGTNNNN"[(i>>(j*3))&7]);
 	    double err = cnt ? (double)kmer_count[i][k][0] / cnt : 0;
