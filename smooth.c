@@ -153,6 +153,56 @@ static void sim(uint8_t *q1, uint8_t *q2, int len, long *d1, long *d2) {
     *d2 = diff2;
 }
 
+/* Taylor (deg 3) implementation of the log */
+static inline double fast_log2(double val) {
+    // FP representation is exponent & mantissa, where
+    // value = 2^E * M.
+    // Hence log2(value) = log2(2^E * M)
+    //                   = log2(2^E)+ log2(M)
+    //                   =        E + log2(M)
+    union { double d; uint64_t x; } u = {val};
+    const int E = ((u.x >> 52) & 2047) - 1024; // exponent E
+    // Initial log2(M) based on mantissa
+    u.x &= ~(2047LL << 52);
+    u.x +=   1023LL << 52;
+
+    val = ((-1/3.) * u.d + 2) * u.d - 2/3.;
+
+    return E + val;
+}
+
+// Fix for platforms that call homopolymers as a single thing, with quals
+// that decay over time (454, PB CCS).
+void homopoly_fix(bam1_t *b) {
+    static double ph2err[256] = {0};
+    if (!ph2err[0]) {
+        for (int i = 0; i < 256; i++)
+            ph2err[i] = pow(10, i/-10.0);
+    }
+
+    uint8_t *seq = bam_get_seq(b);
+    uint8_t *qual = bam_get_qual(b);
+    for (int i = 0; i < b->core.l_qseq; i++) {
+        int s = i; // start of homopoly
+        int base = bam_seqi(seq, i);
+        while (i+1 < b->core.l_qseq && bam_seqi(seq, i+1) == base)
+            i++;
+        // s..i inclusive is now homopolymer
+        if (s == i)
+            continue;
+
+        // Simplest:  reverse if end_qual < start_qual
+        // Next:      average outer-most two, then next two, etc
+        // Best:      fully redistribute so start/end lower qual than centre
+        
+        // Middle route of averaging outer pairs is sufficient?
+        for (int j = s, k = i; j < k; j++,k--) {
+            double e = ph2err[qual[j]] + ph2err[qual[k]];
+            qual[j] = qual[k] = -fast_log2(e/2)*3.0104+.49;
+        }
+    }
+}
+
 #ifdef DEBUG
 int main(int argc, char **argv) {
     qpreserve['Z'] = 1;
@@ -184,9 +234,10 @@ void usage(void) {
     printf("  -B INT         Bin qualities with bin width INT [%d]\n", BLEVEL);
     printf("  -b [A-B=C],... Map qualities A to B inclusive to C; a list\n");
     printf("  -t INT         Use a pool of INT threads for decoding and encoding\n");
+    printf("  -H             Redistribute low quals in homopolymers to both ends\n");
     printf("  -X profile     Custom option sets.  Profiles:\n");
     printf("      illumina   -P2 -R1.2 -B4\n");
-    printf("      pbccs      -P5 -R1.5 -B10\n");
+    printf("      pbccs      -P5 -R1.5 -B10 -H\n");
     printf("      hiseq      -P0 -R0 -b0-0=0,1-1=1,2-9=6,10-19=15,\\\n");
     printf("                     20-24=2225-29=27,30-34=33,35-39=37,40-99=40\n");
     printf("      novaseq    -P0 -R0 -b0-6=2,7-13=12,14-24=18,25-99=36\n");
@@ -206,6 +257,7 @@ int main(int argc, char **argv) {
     htsFormat in_fmt = {0}, out_fmt = {0};
     int blevel = BLEVEL;
     int plevel = PLEVEL;
+    int homopoly = 0;
     double rlevel = RLEVEL;
     hts_tpool *tpool = NULL;
     int verbose = 0;
@@ -219,7 +271,7 @@ int main(int argc, char **argv) {
     gen_map(blevel); // default
 
     int c;
-    while ((c = getopt(argc, argv, "P:B:O:I:b:t:R:vk:X:")) >= 0) {
+    while ((c = getopt(argc, argv, "P:B:O:I:b:t:R:vk:X:H")) >= 0) {
 	switch(c) {
 	case 'I': hts_parse_format(&in_fmt, optarg); break;
 	case 'O': hts_parse_format(&out_fmt, optarg); break;
@@ -265,6 +317,7 @@ int main(int argc, char **argv) {
 		plevel = 5;
 		rlevel = 1.5;
 		gen_map(blevel = 10);
+		homopoly = 1;
 	    } else if (strcmp(optarg, "illumina") == 0) {
 		// -P3 -R1.2 -B8
 		plevel = 3;
@@ -286,6 +339,11 @@ int main(int argc, char **argv) {
 		exit(1);
 	    }
 	    break;
+
+	case 'H':
+	    homopoly = 1;
+	    break;
+
 	case '?':
 	default:
 	    usage();
@@ -332,6 +390,8 @@ int main(int argc, char **argv) {
 	}
 	if (verbose)
 	    memcpy(tmp_qual, bam_get_qual(b), b->core.l_qseq);
+	if (homopoly)
+	    homopoly_fix(b);
         if (plevel > 0)
 	    pblock(bam_get_qual(b), b->core.l_qseq, plevel, NULL/*qmap*/);
 	if (rlevel > 1)
