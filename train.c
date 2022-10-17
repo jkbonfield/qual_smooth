@@ -1,32 +1,6 @@
 // TODO: also sum average called score, so we can compute real vs expected.
 
 /*
-Notes:
-
-Use a self-built consensus (eg samtools consensus, crumble) instead of
-a truth set.
-
-Eg GIAB HG002 chr1 claims:
-
-chr1    4376297 .       G       T       50      PASS    ...
-chr1    4376333 .       A       G       50      PASS    ...
-chr1    4376342 .       T       G       50      PASS    ...
-
-These are all visible in the data set and due to long reads are all
-phased together.  However chr1 4376225 also has a SNP which is phased
-with the other 3 above and not called.  Consequentially it's labelled
-as 3 mismatches.  (It is however missing from the bed file, but it
-casts doubt on the completeness of some calls.)
-
-We may be better producing an overly optimistic het consensus call
-with confidence, so confident not-het is evaluated, confident is-het
-is evaluated, and anything inbetween is skipped.  This means we could
-self-train on a denovo data set using the errors in "obvious" regions
-to tell us something about the error rates in less obvious regions
-too.
-*/
-
-/*
  * Given a corrected reference (eg "bcftools consensus" on a VCF truth
  * set), this compares alignments in BAM et al to group sequence and quality
  * into correct and incorrect, permitting kmer based recalibration of
@@ -43,10 +17,6 @@ too.
  * TODO:
  * - Add bed filter regions too.
  *
- * - Reverse complement too
- *   - Either aggregating by a canonical orientation
- *   - (DONE) Or use the REVERSE flag to store in original BAM orientation
- *
  * - Auto-build a hom/het consensus instead of relying on a truth set.
  *   Like Crumble, we could ignore unknown data and concentrate on clear
  *   hom/het/indel positions.
@@ -59,6 +29,7 @@ too.
 #include <stdio.h>
 #include <getopt.h>
 #include <math.h>
+#include <float.h>
 #include <ctype.h>
 
 #include <htslib/sam.h>
@@ -66,11 +37,14 @@ too.
 #include <htslib/thread_pool.h>
 #include <htslib/regidx.h>
 
-uint32_t (*kmer_count)[3][2] = NULL;
+uint32_t (*kmer_count)[3][2] = NULL; // counts of true and false bases
+double   (*kmer_qual)[3] = NULL;     // sum of estimated errors from qual
 #define WIN_LEN 5
 #define WIN_SHIFT 0 // +ve => move right
 #define WIN_MASK ((1<<(3*WIN_LEN))-1)
 #define KMER_INIT (05555555555 & WIN_MASK);
+
+double Perr[256];
 
 // Put kmer mismatch, ins and del into own stats
 #define KMAT 0
@@ -220,6 +194,14 @@ int in_bed(regitr_t *bed_itr, hts_pos_t pos) {
     return pos >= bed_itr->beg && pos <= bed_itr->end ? 1 : 0;
 }
 
+static inline void incr_kmer(regitr_t *bed_itr, hts_pos_t rpos,
+			     uint32_t kmer, int type, int qual, int err) {
+    if (in_bed(bed_itr, rpos)) {
+	kmer_count[kmer][type][err]++;
+	kmer_qual[kmer][err] += Perr[qual];
+    }
+}
+
 void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, hts_pos_t *map,
 		      bam1_t *b, regidx_t *bed, regitr_t *bed_itr) { 
     const int V=0; // DEBUG only
@@ -238,6 +220,15 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, hts_pos_t *map,
 	L_done = 1;
 
 	kmer_count = calloc(WIN_MASK+1, sizeof(*kmer_count));
+	kmer_qual  = malloc((WIN_MASK+1) * sizeof(*kmer_qual));
+	int i, j, k;
+	for (k = 0; k < WIN_MASK; k++)
+	    for (j = 0; j < 3; j++)
+		kmer_qual[k][j] = DBL_MIN;
+
+	Perr[0] = 1;
+	for (i = 1; i < 256; i++)
+	    Perr[i] += pow(10, -i/10.0);
     }
 
     hts_pos_t rpos = b->core.pos; // ref pos; cons pos = map[rpos]
@@ -264,6 +255,7 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, hts_pos_t *map,
 
 	for (int j = 0; j < cig_len; j++) {
 	    uint8_t qbase = seq_nt16_str[bam_seqi(qseq, qpos)];
+	    uint8_t qqual = qual[qpos];
 	    uint8_t rbase = ref[map[rpos]+nth];
 
 	    uint32_t kmer = context_i(b, qpos);
@@ -283,21 +275,20 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, hts_pos_t *map,
 		if (islower(rbase)) {
 		    if (V) printf("dm %ld\t%c %c *\n", rpos, rbase, qbase);
 #ifndef MATCH_ONLY
-		    if (in_bed(bed_itr, rpos)) // base vs cons-ins
-			kmer_count[kmer][KDEL][0]++;
+		    // base vs cons-ins
+		    incr_kmer(bed_itr, rpos, kmer, KDEL, 0, qqual);
 #endif
 		} else {
 		    if (qbase == ambig(rbase, qbase)) {
 			if (V>1)
 			    printf("M  %ld\t%c %c\n", rpos, rbase, qbase);
-			if (in_bed(bed_itr, rpos))
-			    kmer_count[kmer][KMAT][1]++;
+			incr_kmer(bed_itr, rpos, kmer, KMAT, 1, qqual);
 		    } else if (rbase == '*') {
 			if (V)
 			    printf("im %ld\t%c %c *\n", rpos, rbase, qbase);
 #ifndef MATCH_ONLY
-			if (in_bed(bed_itr, rpos)) // ins vs cons-del
-			    kmer_count[kmer][KINS][0]++;
+			// ins vs cons-del
+			incr_kmer(bed_itr, rpos, kmer, KINS, 0, qqual);
 #endif
 		    } else if (rbase != 'N') {
 			if (V) {
@@ -305,8 +296,8 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, hts_pos_t *map,
 				printf("%.5s\t%05o\t", context_s(b, qpos), kmer);
 			    printf("X  %ld\t%c %c %d *\n", rpos, rbase, qbase, qual[qpos]);
 			}
-			if (in_bed(bed_itr, rpos)) // mismatch
-			    kmer_count[kmer][KMAT][0]++;
+			// mismatch
+			incr_kmer(bed_itr, rpos, kmer, KMAT, 0, qqual);
 		    }
 		}
 
@@ -316,8 +307,8 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, hts_pos_t *map,
 		    if (V)
 			printf("mD %ld\t. %c *\n", rpos,  qbase);
 #ifndef MATCH_ONLY
-		    if (in_bed(bed_itr, rpos)) // ins in cons, absent here
-			kmer_count[kmer][KDEL][0]++;
+		    // ins in cons, absent here
+		    incr_kmer(bed_itr, rpos, kmer, KDEL, 0, qqual);
 #endif
 		}
 
@@ -331,23 +322,23 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, hts_pos_t *map,
 		    if (qbase == ambig(rbase, qbase)) {
 			if (V>1) printf("mi %ld\t%c %c\n", rpos, rbase, qbase);
 #ifndef MATCH_ONLY
-			// Actually [KMAT][1]
-			if (in_bed(bed_itr, rpos)) // ins matching cons-ins
-			    kmer_count[kmer][KINS][1]++;
+			// Actually [KMAT][1] ?
+			// ins matching cons-ins
+			incr_kmer(bed_itr, rpos, kmer, KINS, 1, qqual);
 #endif
 		    } else {
 			if (V>1) printf("xi %ld\t%c %c\n", rpos, rbase, qbase);
 #ifndef MATCH_ONLY
 			// Maybe [KMAT][0]?
-			if (in_bed(bed_itr, rpos)) // mismatching cons-ins
-			    kmer_count[kmer][KINS][0]++;
+			// mismatching cons-ins
+			incr_kmer(bed_itr, rpos, kmer, KINS, 0, qqual);
 #endif
 		    }
 		} else {
 		    if (V) printf("I  %ld\t. %c *\n", rpos, qbase);
 #ifndef MATCH_ONLY
-		    if (in_bed(bed_itr, rpos))
-			kmer_count[kmer][KINS][0]++; // ins vs cons
+		    // ins vs cons
+		    incr_kmer(bed_itr, rpos, kmer, KINS, 0, qqual);
 #endif
 		}
 		qpos++;
@@ -358,14 +349,14 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, hts_pos_t *map,
 		if (rbase == '*') {
 		    if (V>1) printf("md %ld\t%c .\n", rpos, rbase);
 #ifndef MATCH_ONLY
-		    if (in_bed(bed_itr, rpos))
-			kmer_count[kmer][KDEL][1]++; // del matching cons-del
+		    // del matching cons-del
+		    incr_kmer(bed_itr, rpos, kmer, KDEL, 1, qqual);
 #endif
 		} else {
 		    if (V) printf("D  %ld\t%c . *\n", rpos, rbase);
 #ifndef MATCH_ONLY
-		    if (in_bed(bed_itr, rpos))
-			kmer_count[kmer][KDEL][0]++; // del vs cons-base
+		    // del vs cons-base
+		    incr_kmer(bed_itr, rpos, kmer, KDEL, 0, qqual);
 #endif
 		}
 		rpos++;
@@ -397,15 +388,18 @@ void dump_kmers(void) {
 	    continue;
 
 	int all_mis = 0;
+	double all_err = 0;
 	for (k = 0; k < 3; k++) {
 	    for (j = WIN_LEN-1; j >= 0; j--)
 		putchar("ACGTNNNN"[(i>>(j*3))&7]);
 	    double err = cnt ? (double)kmer_count[i][k][0] / cnt : 0;
 	    int qval = err ? -10*log10(err)+.5 : 99;
-	    printf("\t%c\t%d\t%d\t%d\n",
-		   "MID"[k], kmer_count[i][k][0], cnt, qval);
+	    printf("\t%c\t%d\t%d\t%d\t%d\n",
+		   "MID"[k], kmer_count[i][k][0], cnt, qval,
+		   (int)(-4.343*log(kmer_qual[i][k]/cnt)+.5));
 
 	    all_mis += kmer_count[i][k][0];
+	    all_err += kmer_qual[i][k];
 	}
 
 	// Combined stats
@@ -413,7 +407,8 @@ void dump_kmers(void) {
 	    putchar("ACGTNNNN"[(i>>(j*3))&7]);
 	double err = all_mis ? (double)all_mis / cnt : 0;
 	int qval = err ? -10*log10(err)+.5 : 99;
-	printf("\t?\t%d\t%d\t%d\n", all_mis, cnt, qval);
+	printf("\t?\t%d\t%d\t%d\t%d\n", all_mis, cnt, qval,
+	       (int)(-4.343*log(all_err/cnt)+.5));
     }
 }
 
