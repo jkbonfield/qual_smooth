@@ -1,3 +1,5 @@
+// TODO: also sum average called score, so we can compute real vs expected.
+
 /*
 Notes:
 
@@ -33,6 +35,7 @@ too.
  * Start with:
  * samtools faidx $HREF38 chr1 \|
  * bcftools consensus -I --mark-ins lc --mark-del "*" truth.vcf > chr1.fa
+ * ./qual_train -b truth.bed -f $HREF38 -r chr1 truth.bam
  *
  * Then "*" is del, [acgt] is ins, and RYMSW etc het.
  * => can map ref coords to sample coords.
@@ -61,6 +64,7 @@ too.
 #include <htslib/sam.h>
 #include <htslib/faidx.h>
 #include <htslib/thread_pool.h>
+#include <htslib/regidx.h>
 
 uint32_t (*kmer_count)[3][2] = NULL;
 #define WIN_LEN 5
@@ -203,8 +207,26 @@ static uint32_t context_i(bam1_t *b, int pos) {
     return ctx;
 }
 
-void accumulate_kmers(const uint8_t *ref, hts_pos_t *map, bam1_t *b) { 
+int in_bed(regitr_t *bed_itr, hts_pos_t pos) {
+    if (!bed_itr)
+	return 1;
+
+    while (pos > bed_itr->end) {
+	if (!regitr_loop(bed_itr)) {
+	    bed_itr->beg = HTS_POS_MAX; // next region is never
+	    return 0;
+	}
+    }
+    return pos >= bed_itr->beg && pos <= bed_itr->end ? 1 : 0;
+}
+
+void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, hts_pos_t *map,
+		      bam1_t *b, regidx_t *bed, regitr_t *bed_itr) { 
     const int V=0; // DEBUG only
+
+    if (bed_itr)
+	regidx_overlap(bed, sam_hdr_tid2name(hdr, b->core.tid),
+		       b->core.pos, bam_endpos(b), bed_itr);
 
     static uint8_t L[256], L_done = 0;
     if (!L_done) {
@@ -261,18 +283,21 @@ void accumulate_kmers(const uint8_t *ref, hts_pos_t *map, bam1_t *b) {
 		if (islower(rbase)) {
 		    if (V) printf("dm %ld\t%c %c *\n", rpos, rbase, qbase);
 #ifndef MATCH_ONLY
-		    kmer_count[kmer][KDEL][0]++; // base vs cons-ins
+		    if (in_bed(bed_itr, rpos)) // base vs cons-ins
+			kmer_count[kmer][KDEL][0]++;
 #endif
 		} else {
 		    if (qbase == ambig(rbase, qbase)) {
 			if (V>1)
 			    printf("M  %ld\t%c %c\n", rpos, rbase, qbase);
-			kmer_count[kmer][KMAT][1]++;
+			if (in_bed(bed_itr, rpos))
+			    kmer_count[kmer][KMAT][1]++;
 		    } else if (rbase == '*') {
 			if (V)
 			    printf("im %ld\t%c %c *\n", rpos, rbase, qbase);
 #ifndef MATCH_ONLY
-			kmer_count[kmer][KINS][0]++; // ins vs cons-del
+			if (in_bed(bed_itr, rpos)) // ins vs cons-del
+			    kmer_count[kmer][KINS][0]++;
 #endif
 		    } else if (rbase != 'N') {
 			if (V) {
@@ -280,7 +305,8 @@ void accumulate_kmers(const uint8_t *ref, hts_pos_t *map, bam1_t *b) {
 				printf("%.5s\t%05o\t", context_s(b, qpos), kmer);
 			    printf("X  %ld\t%c %c %d *\n", rpos, rbase, qbase, qual[qpos]);
 			}
-			kmer_count[kmer][KMAT][0]++; // mismatch
+			if (in_bed(bed_itr, rpos)) // mismatch
+			    kmer_count[kmer][KMAT][0]++;
 		    }
 		}
 
@@ -290,7 +316,8 @@ void accumulate_kmers(const uint8_t *ref, hts_pos_t *map, bam1_t *b) {
 		    if (V)
 			printf("mD %ld\t. %c *\n", rpos,  qbase);
 #ifndef MATCH_ONLY
-		    kmer_count[kmer][KDEL][0]++; // ins in cons, absent here
+		    if (in_bed(bed_itr, rpos)) // ins in cons, absent here
+			kmer_count[kmer][KDEL][0]++;
 #endif
 		}
 
@@ -305,19 +332,22 @@ void accumulate_kmers(const uint8_t *ref, hts_pos_t *map, bam1_t *b) {
 			if (V>1) printf("mi %ld\t%c %c\n", rpos, rbase, qbase);
 #ifndef MATCH_ONLY
 			// Actually [KMAT][1]
-			kmer_count[kmer][KINS][1]++; // ins matching cons-ins
+			if (in_bed(bed_itr, rpos)) // ins matching cons-ins
+			    kmer_count[kmer][KINS][1]++;
 #endif
 		    } else {
 			if (V>1) printf("xi %ld\t%c %c\n", rpos, rbase, qbase);
 #ifndef MATCH_ONLY
 			// Maybe [KMAT][0]?
-			kmer_count[kmer][KINS][0]++; // mismatching cons-ins
+			if (in_bed(bed_itr, rpos)) // mismatching cons-ins
+			    kmer_count[kmer][KINS][0]++;
 #endif
 		    }
 		} else {
 		    if (V) printf("I  %ld\t. %c *\n", rpos, qbase);
 #ifndef MATCH_ONLY
-		    kmer_count[kmer][KINS][0]++; // ins vs cons
+		    if (in_bed(bed_itr, rpos))
+			kmer_count[kmer][KINS][0]++; // ins vs cons
 #endif
 		}
 		qpos++;
@@ -328,12 +358,14 @@ void accumulate_kmers(const uint8_t *ref, hts_pos_t *map, bam1_t *b) {
 		if (rbase == '*') {
 		    if (V>1) printf("md %ld\t%c .\n", rpos, rbase);
 #ifndef MATCH_ONLY
-		    kmer_count[kmer][KDEL][1]++; // del matching cons-del
+		    if (in_bed(bed_itr, rpos))
+			kmer_count[kmer][KDEL][1]++; // del matching cons-del
 #endif
 		} else {
 		    if (V) printf("D  %ld\t%c . *\n", rpos, rbase);
 #ifndef MATCH_ONLY
-		    kmer_count[kmer][KDEL][0]++; // del vs cons-base
+		    if (in_bed(bed_itr, rpos))
+			kmer_count[kmer][KDEL][0]++; // del vs cons-base
 #endif
 		}
 		rpos++;
@@ -393,11 +425,16 @@ int main(int argc, char **argv) {
     hts_pos_t *map = NULL;
     bam1_t *b = bam_init1();
     uint8_t *ref = NULL;
+    regidx_t *bed = NULL;
+    regitr_t *bed_itr = NULL;
+    char *reg = NULL;
+    hts_itr_t *itr = NULL;
 
     int c;
-    while ((c = getopt(argc, argv, "I:f:")) >= 0) {
+    while ((c = getopt(argc, argv, "I:f:b:r:")) >= 0) {
 	switch(c) {
 	case 'I': hts_parse_format(&in_fmt, optarg); break;
+
 	case 'f': {
 	    if (!(fai = fai_load(optarg))) {
 		fprintf(stderr, "Failed to load consensus fasta\n");
@@ -406,6 +443,18 @@ int main(int argc, char **argv) {
 	    break;
 	}
 	    
+	case 'b':
+	    bed = regidx_init(optarg, NULL, NULL, 0, NULL);
+	    if (!bed) {
+		fprintf(stderr, "Failed to load bed file\n");
+		goto err;
+	    }
+	    break;
+
+	case 'r':
+	    reg = optarg;
+	    break;
+
 	case '?':
 	default:
 	    fprintf(stderr, "Usage: [blah]\n");
@@ -427,11 +476,30 @@ int main(int argc, char **argv) {
     if (!(hdr = sam_hdr_read(fp)))
 	goto err;
 
+    bed_itr = bed ? regitr_init(bed) : NULL;
+
+    if (reg) {
+	hts_idx_t *idx = sam_index_load(fp, fn);
+	if (!idx) {
+	    fprintf(stderr, "Unable to load index\n");
+	    goto err;
+	}
+	
+	if (!(itr = sam_itr_querys(idx, hdr, reg))) {
+	    fprintf(stderr, "Unable to query region '%s'\n", reg);
+	    goto err;
+	}
+
+	hts_idx_destroy(idx);
+    }
+
     // Process alignments
     int r;
     int last_tid = -1;
     hts_pos_t ref_len;
-    while ((r = sam_read1(fp, hdr, b)) >= 0) {
+    while ((r = (reg
+		 ? sam_itr_next(fp, itr, b)
+		 : sam_read1(fp, hdr, b))) >= 0) {
 	if (b->core.tid < 0)
 	    continue;
 	if (b->core.tid != last_tid) {
@@ -450,7 +518,7 @@ int main(int argc, char **argv) {
 	}
 	//puts(bam_get_qname(b));
 
-	accumulate_kmers(ref, map, b);
+	accumulate_kmers(hdr, ref, map, b, bed, bed_itr);
     }
     if (r != -1)
 	goto err;
@@ -462,6 +530,9 @@ int main(int argc, char **argv) {
     fai_destroy(fai);
     if (ref) free(ref);
     if (map) free(map);
+    if (bed) regidx_destroy(bed);
+    if (bed_itr) regitr_destroy(bed_itr);
+    if (itr) hts_itr_destroy(itr);
 
     dump_kmers();
 
