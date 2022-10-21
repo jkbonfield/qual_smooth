@@ -1,4 +1,100 @@
-// TODO: also sum average called score, so we can compute real vs expected.
+/*
+ * Tracking of kmers for correctly identified in consensus vs incorrect,
+ * based on the central kmer base.  E.g.
+ *
+ * CONS:  AGCTTGAGCTAGG
+ *              x
+ * SEQ:   AGCTTGTGCTAGG
+ *
+ * 3 types of state per kmer
+ * - KMER is correct, cented    (AGCTT GCTTG GCTAG CTAGG)   TRUE
+ * - KMER is incorrect, centred (TGTGC)                     FALSE
+ * - KMER overlaps error        (CTTGT TTGTG GTGCT TGCTA)   IGNORE
+ *
+ * To do this, we could compute consensus kmers and seq kmers and
+ * compare, but consensus has two alleles and they're unphased.
+ * So instead we march through seq and ref one base at a time, comparing
+ * that central position, and mark our kmers as we go.  These need to
+ * have a history before fully updating counts, as we may need to edit
+ * preious <correct> kmers and revise them to <ignore> when we see a
+ * <incorrect> status (plus subsequent few few too, if not erroneous).
+ *
+ * Q: for deletions, should we also include the consensus kmers?
+ * Eg if CONS is AGTTTAGG and we have seq AG(3D)AGG then we're only
+ * recording one deletion at the D cigar op, but maybe all the kmers with
+ * T in are erroneous, so when we report them as seen elsewhere we know
+ * their probability of being missed.
+ * Currently we don't.  Our kmer is purely from seq.  Se given we've seen
+ * it in the seq, what is the probability of X, I and D errors.
+ */
+
+/*
+ * Types are classified in the context of the consensus, not ref.
+ * So consider a homozygous insertion to the reference.
+ *
+ * If our seq has the insertion, it is a match (recorded as correct ins).
+ * If it doesn't it is a mismatch (even if it matches ref) and is recorded
+ * as incorrect ins.
+ *
+ * Similarly for deletions and matches.
+ *
+ * While arguably seq matching cons perfect is "match", we separate by
+ * consensus type as this allows us to judge the impact of reference bias.
+ * In theory match_false/match_true should be the same ratio as
+ * ins_false/ins_true, but where not this is because we aligned preferentially
+ * to reference and not the real sample consensus.  (A realigner should
+ * solve that, so we have a way to evaluate those too.)
+ *
+ * Hence KMAT, KINS and KDEL are all "matching consensus" categories and
+ * allow us to detect the substitution errors from the instrument.
+ * The "true" count for KMAT/KINS/KDEL are true cons matches.
+ * The "false" count for KMAT is substitution errors.
+ *
+ * We also have overcalls and undercalls categories, where we have additional
+ * insertions and deletions in the sequence with respect to the consensus.
+ * These are recorded in the "false" count for KINS/KDEL respectively.
+ *
+ * FIXME: what about correct INS base counts but subtitution errors?
+ * For now we're not recording those.
+ */
+
+/*
+Input: "bcftools consensus" format:
+- 1 upper-case base per 1 ref base (so coords map)
+  - Ambiguity codes (M, R, Y etc) for known SNPs
+- lower-case cons base = inserted base
+- * = deletion
+
+Problem: cannot represent ambiguity in insertion, so reads lacking the
+insertion are labelled as having a deletion vs the sample.
+
+Input: "samtools consensus --mark-ins" format:
+- Standard uppercase bases are in ref coordinates
+- * is both-allele deletion
+- Lowercase is single-allele deletion
+- Underscore means next base is insertion (overules 1st statement)
+
+Thus insertions can themselves be uppercase (both alleles with insertion,
+maybe ambiguity code if they differ) or lowercase (one allele only with
+insertion).
+
+Quality values, if in FASTQ format, also have the "_" symbol.
+
+
+Both input formats internally get converted to a third different format:
+- Uppercase 7-bit ASCII = aligned to a ref coord
+- * or lowercase means a deletion.
+- Top bit set means insertion (x80+upper or x80+lower for hom/het).
+
+This gives us easier matching of nth base of insertion vs nth pos in ref.
+*/
+
+
+/* TODO:
+- Additional filtering via halo around lower-case and within N bases
+  of STRs, etc.  This ensures we only calibrate on regions with
+  certainty in the consensus.
+*/
 
 /*
  * Given a corrected reference (eg "bcftools consensus" on a VCF truth
@@ -31,12 +127,30 @@
 #include <math.h>
 #include <float.h>
 #include <ctype.h>
+#include <assert.h>
 
 #include <htslib/sam.h>
 #include <htslib/faidx.h>
 #include <htslib/thread_pool.h>
 #include <htslib/regidx.h>
 
+// -- good ones
+#define K_MAT_M 0 // match in M op
+#define K_MAT_I 1 // match in I op
+#define K_MAT_D 2 // match in D op
+
+// -- bad ones
+#define K_WRONG 3 // wrong below this point
+#define K_MIS_M 3 // mismatch in M op
+#define K_MIS_I 4 // mismatch in I op
+#define K_OVER  5 // overcall;  rogue I op
+#define K_UNDER 6 // undercall; rogue D op
+#define K_NCAT  (K_UNDER+1)
+#define K_CAT "MIDxiou"
+uint32_t (*k_count)[K_NCAT] = NULL;
+double   (*k_qual) [K_NCAT] = NULL;
+
+// [4<<WIN_LEN][TYPE][IS_CORRECT]  (type being match, ins and del)
 uint32_t (*kmer_count)[3][2] = NULL; // counts of true and false bases
 double   (*kmer_qual)[3] = NULL;     // sum of estimated errors from qual
 #define WIN_LEN 5
@@ -44,12 +158,15 @@ double   (*kmer_qual)[3] = NULL;     // sum of estimated errors from qual
 #define WIN_MASK ((1<<(3*WIN_LEN))-1)
 #define KMER_INIT (05555555555 & WIN_MASK);
 
+#define MIN(a,b) ((a)<(b)?(a):(b))
+
+
 double Perr[256];
 
 // Put kmer mismatch, ins and del into own stats
-#define KMAT 0
-#define KINS 1
-#define KDEL 2
+#define KMAT   0 // matching base
+#define KINS   1 // matching insertion
+#define KDEL   2 // matching deletion
 
 // Accumulate on orig seq strand only.
 //
@@ -69,20 +186,53 @@ double Perr[256];
  * Builds a mapping table of reference positions to consensus
  * positions:  map[ref_pos] = cons_pos.
  *
- * Lowercase = insertion
- * * = deletion
+ * If mark_ins is zero then we assume this is a bcftools consensus file:
+ *    * = deletion
+ *    Lowercase = insertion
+ *
+ * If mark_ins is non-zero then we assume it to be a samtools consensus
+ * file produced with --show-del yes --mark-ins.
+ *    * = homozygous deletion
+ *    _ = next base is insertion (_ as + is probelmatic at start of a line)
+ *    Lowercase = heterozygous indel
+ *
+ * Internally we change both consensus sequences to the same third form.
+ *    * = homozygous deletion
+ *    lowercase = heterozygous deletion (1 allele deleted)
+ *    Top bit set = insertion.
+ *    Top-bit "lowercase" = heterozygous insertion (1 allele inserted)
  */
-hts_pos_t *build_ref_map(const uint8_t *ref, hts_pos_t len) {
+hts_pos_t *build_ref_map(uint8_t *ref, hts_pos_t *len_p, int mark_ins) {
+    hts_pos_t len = *len_p;
     hts_pos_t *map = malloc((len+1) * sizeof(*map));
     if (!map)
 	return NULL;
 
     // As we have deletions shown, can guarantee ref_len <= cons_len.
     hts_pos_t i, r;
-    for (i = r = 0; i < len; i++) {
-	if (ref[i] == '*' || isupper(ref[i]))
-	    map[r++] = i;
+    if (mark_ins == 0) {
+	for (i = r = 0; i < len; i++) {
+	    if (ref[i] == '*' || isupper(ref[i]))
+		map[r++] = i;
+	    else if (islower(ref[i]))
+		ref[i] = toupper(ref[i]) | 0x80; // internal marker for ins
+	}
+    } else {
+	// TODO use qual and have a filter for ref bases to skip.
+	int k;
+	for (i = k = r = 0; i < len; i++) {
+	    if (ref[i] == '_') {
+		ref[k++] = ref[++i] | 0x80; // mark insertion
+	    } else {
+		map[r++] = k;
+		ref[k++] = ref[i];
+	    }
+	}
+	*len_p = k;
     }
+
+    //for (i = 0; i < len; i++) printf("%ld\t%ld\t%d\n", i, map[i], ref[i]);
+
     map[r] = i; // so we can compare map[pos] with map[pos+1] to find ins
     return map;
 }
@@ -90,6 +240,7 @@ hts_pos_t *build_ref_map(const uint8_t *ref, hts_pos_t len) {
 // If ref is an ambiguity code and query is compataible, then return
 // query, otherwise return N
 uint8_t ambig(uint8_t ref, uint8_t query) {
+    ref &= ~0x80;
     static uint8_t ambig_base[256] = {0};
     if (!ambig_base[0]) {
 	memset(ambig_base, 0xff, 256); // NN
@@ -194,16 +345,108 @@ int in_bed(regitr_t *bed_itr, hts_pos_t pos) {
     return pos >= bed_itr->beg && pos <= bed_itr->end ? 1 : 0;
 }
 
+int kmer_skip = 0;
+int kmer_hist_kmer[WIN_LEN/2];
+int kmer_hist_type[WIN_LEN/2];
+int kmer_hist_ok[WIN_LEN/2];
+double kmer_hist_qual[WIN_LEN/2];
+int64_t kmer_num = 0;
+
 static inline void incr_kmer(regitr_t *bed_itr, hts_pos_t rpos,
-			     uint32_t kmer, int type, int qual, int err) {
+			     uint32_t kmer, int type, int ok, int qual) {
+//    printf("Incr %05o %c %d %d\n", kmer, "MID"[type], ok, qual);
+
     if (in_bed(bed_itr, rpos)) {
-	kmer_count[kmer][type][err]++;
-	kmer_qual[kmer][err] += Perr[qual];
+	// Keep list of last WIN_LEN/2 kmers added (if OK), so we can
+	// undo them if we add a not-OK one.  Similarly track the numeber
+	// of subsequent kmers to skip (if OK).
+	if (kmer_skip && ok) {
+	    kmer_skip--;
+	    //kmer_hist_ok[(kmer_num++) % (WIN_LEN/2)] = 0;
+	    //printf("Skip %05o\n", kmer);
+	} else {
+	    kmer_count[kmer][type][ok]++;
+	    kmer_qual[kmer][type] += Perr[qual];
+	}
+
+	// Revert to ignore
+	if (!ok) {
+	    for (int i = 0; i < WIN_LEN/2; i++) {
+		int h_ok = kmer_hist_ok[i];
+		if (!h_ok) {
+		    //printf("Kmer %05o wasn't OK anyway\n", kmer_hist_kmer[i]);
+		    continue;
+		}		    
+		kmer_count[kmer_hist_kmer[i]][kmer_hist_type[i]][h_ok]--;
+		kmer_qual [kmer_hist_kmer[i]][kmer_hist_type[i]]
+		    -= kmer_hist_qual[i];
+		kmer_hist_ok[i] = 0; // prevent another decr on next-err
+		//printf("Reset %05o to ignore\n", kmer_hist_kmer[i]);
+	    }
+	    kmer_skip = WIN_LEN/2;
+	}
+
+	// cache
+	int idx = kmer_num % (WIN_LEN/2); // could also round and AND
+	kmer_hist_kmer[idx] = kmer;
+	kmer_hist_type[idx] = type;
+	kmer_hist_ok  [idx] = ok;
+	kmer_hist_qual[idx] = Perr[qual];
+	kmer_num++;
+    }
+}
+
+static inline void incr_kmer2(regitr_t *bed_itr, hts_pos_t rpos,
+			      uint32_t kmer, int type, int ok, int qual) {
+    int ok2 = type<K_WRONG;
+    assert(ok == ok2);
+    
+//    printf("Incr %05o %c %d %d\n", kmer, "MID"[type], ok, qual);
+
+    if (in_bed(bed_itr, rpos)) {
+	// Keep list of last WIN_LEN/2 kmers added (if OK), so we can
+	// undo them if we add a not-OK one.  Similarly track the numeber
+	// of subsequent kmers to skip (if OK).
+	if (kmer_skip && ok) {
+	    kmer_skip--;
+	    //printf("Skip %05o\n", kmer);
+	} else {
+	    k_count[kmer][type]++;
+	    k_qual[kmer][type] += Perr[qual];
+	}
+
+	// Revert to ignore
+	if (!ok) {
+	    for (int i = 0; i < WIN_LEN/2; i++) {
+		int h_ok = kmer_hist_type[i] < K_WRONG;
+		if (h_ok) {
+		    k_count[kmer_hist_kmer[i]][kmer_hist_type[i]]--;
+		    k_qual [kmer_hist_kmer[i]][kmer_hist_type[i]]
+			-= kmer_hist_qual[i];
+		}
+		kmer_hist_type[i] = 99; // prevent double decr is more err
+		//printf("Reset %05o to ignore\n", kmer_hist_kmer[i]);
+	    }
+	    kmer_skip = WIN_LEN/2;
+	}
+
+	// cache
+	int idx = kmer_num % (WIN_LEN/2); // could also round and AND
+	kmer_hist_kmer[idx] = kmer;
+	kmer_hist_type[idx] = type;
+	kmer_hist_qual[idx] = Perr[qual];
+	kmer_num++;
+    } else {
+	// TODO: set kmer_hist_type to 99.  Optimise this as only
+	// need it on in-bed to out-bed transitions
+	for (int i = 0; i < WIN_LEN/2; i++)
+	    kmer_hist_type[i] = 99;
     }
 }
 
 void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, hts_pos_t *map,
-		      bam1_t *b, regidx_t *bed, regitr_t *bed_itr) { 
+		      bam1_t *b, regidx_t *bed, regitr_t *bed_itr,
+		      int mark_ins) { 
     const int V=0; // DEBUG only
 
     if (bed_itr)
@@ -226,6 +469,12 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, hts_pos_t *map,
 	    for (j = 0; j < 3; j++)
 		kmer_qual[k][j] = DBL_MIN;
 
+	k_count = calloc(WIN_MASK+1, sizeof(*k_count));
+	k_qual  = calloc(WIN_MASK+1, sizeof(*k_qual));
+	for (k = 0; k < WIN_MASK; k++)
+	    for (j = 0; j < K_NCAT; j++)
+		kmer_qual[k][j] = DBL_MIN;
+
 	Perr[0] = 1;
 	for (i = 1; i < 256; i++)
 	    Perr[i] += pow(10, -i/10.0);
@@ -237,7 +486,14 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, hts_pos_t *map,
     uint8_t *qseq = bam_get_seq(b);
     uint8_t *qual = bam_get_qual(b);
     int ncig = b->core.n_cigar;
+    int ndel = 0;
 
+// 0x80 = ins                                   80-F0 1xxx ....
+// 0x80+uppercase = HOM ins (both alleles)      C0-D0 110x ....
+// 0x80+lowercase = HET ins (one allele only)   E0-F0 111x ....
+#define isins(c) ((c) & 0x80)
+#define isins_hom(c) (((c) & 0xe0) == 0xc0)
+#define isins_het(c) (((c) & 0xe0) == 0xe0)
     if (V) printf("SEQ %s\n", bam_get_qname(b));
     for (int i = 0; i < ncig; i++) {
 	int cig_op = bam_cigar_op(cig[i]);
@@ -272,23 +528,27 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, hts_pos_t *map,
 	    case BAM_CDIFF:
 	    case BAM_CEQUAL:
 		// Both seq and ref continue in sync.
-		if (islower(rbase)) {
+		if (isins_hom(rbase)) {
 		    if (V) printf("dm %ld\t%c %c *\n", rpos, rbase, qbase);
 #ifndef MATCH_ONLY
-		    // base vs cons-ins
-		    incr_kmer(bed_itr, rpos, kmer, KDEL, 0, qqual);
+		    // TYPE: undercall (cons has an insertion, we did not)
+		    //incr_kmer(bed_itr, rpos, kmer, KDEL, 0, qqual);
+		    incr_kmer2(bed_itr, rpos, kmer, K_UNDER, 0, qqual);
 #endif
 		} else {
 		    if (qbase == ambig(rbase, qbase)) {
 			if (V>1)
 			    printf("M  %ld\t%c %c\n", rpos, rbase, qbase);
-			incr_kmer(bed_itr, rpos, kmer, KMAT, 1, qqual);
+			// TYPE: match-match
+			//incr_kmer(bed_itr, rpos, kmer, KMAT, 1, qqual);
+			incr_kmer2(bed_itr, rpos, kmer, K_MAT_M, 1, qqual);
 		    } else if (rbase == '*') {
 			if (V)
 			    printf("im %ld\t%c %c *\n", rpos, rbase, qbase);
 #ifndef MATCH_ONLY
-			// ins vs cons-del
-			incr_kmer(bed_itr, rpos, kmer, KINS, 0, qqual);
+			// TYPE: overcall
+			//incr_kmer(bed_itr, rpos, kmer, KINS, 0, qqual);
+			incr_kmer2(bed_itr, rpos, kmer, K_OVER, 0, qqual);
 #endif
 		    } else if (rbase != 'N') {
 			if (V) {
@@ -296,20 +556,50 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, hts_pos_t *map,
 				printf("%.5s\t%05o\t", context_s(b, qpos), kmer);
 			    printf("X  %ld\t%c %c %d *\n", rpos, rbase, qbase, qual[qpos]);
 			}
-			// mismatch
-			incr_kmer(bed_itr, rpos, kmer, KMAT, 0, qqual);
+
+			// TYPE: substitution
+			//incr_kmer(bed_itr, rpos, kmer, KMAT, 0, qqual);
+			incr_kmer2(bed_itr, rpos, kmer, K_MIS_M, 0, qqual);
 		    }
 		}
 
 		// Check if map[rpos] and map[rpos+1] are more than 1 apart,
 		// indicating insertion in cons which is absent in seq.
-		if (map[rpos+1] - map[rpos] != 1) {
+		//
+		// Further more if we have a 5bp insertion in cons and it's
+		// absent here, then we have 5 deletion kmers to mark up,
+		// not just the one.
+		// TODO: (we should have started earlier then)
+		if (ndel || (map[rpos+1] - map[rpos] != 1 && i < ncig &&
+			     !(bam_cigar_op(cig[i+1]) == BAM_CINS ||
+			       bam_cigar_op(cig[i+1]) == BAM_CPAD))) {
+		    // Nominal deletion length
+		    if (!ndel)
+			ndel = map[rpos+1] - map[rpos] - 1 - WIN_LEN/2;
+		    ndel--;
+
+		    // 2nd alternative length based on heterozyugous ins
+		    // to consensus
+		    int ndel2 = 0, k = rpos+1;
+		    while (ref[k] && isins(ref[k]))
+			ndel2 += isins_hom(ref[k++]);
 		    if (V)
-			printf("mD %ld\t. %c *\n", rpos,  qbase);
+			printf("Ins of = %d,%d in ref, absent in seq\n",
+			       ndel, ndel2);
+		    // Correct?
+		    // May wish to check the one that closest matches the
+		    // next cigar op.
+		    ndel = MIN(ndel,ndel2);
+
+		    if (ndel) {
+			if (V)
+			    printf("mD %ld\t. %c *\n", rpos,  qbase);
 #ifndef MATCH_ONLY
-		    // ins in cons, absent here
-		    incr_kmer(bed_itr, rpos, kmer, KDEL, 0, qqual);
+			// TYPE: undercall (cons had insertion, we did not)
+			//incr_kmer(bed_itr, rpos, kmer, KDEL, 0, qqual);
+			incr_kmer2(bed_itr, rpos, kmer, K_UNDER, 0, qqual);
 #endif
+		    }
 		}
 
 		qpos++;
@@ -317,28 +607,28 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, hts_pos_t *map,
 		break;
 
 	    case BAM_CINS:
-		if (islower(rbase)) {
-		    // TODO: also check base matches
+		if (isins(rbase)) {
 		    if (qbase == ambig(rbase, qbase)) {
 			if (V>1) printf("mi %ld\t%c %c\n", rpos, rbase, qbase);
 #ifndef MATCH_ONLY
-			// Actually [KMAT][1] ?
-			// ins matching cons-ins
-			incr_kmer(bed_itr, rpos, kmer, KINS, 1, qqual);
+			// TYPE: ins-match
+			//incr_kmer(bed_itr, rpos, kmer, KINS, 1, qqual);
+			incr_kmer2(bed_itr, rpos, kmer, K_MAT_I, 1, qqual);
 #endif
 		    } else {
 			if (V>1) printf("xi %ld\t%c %c\n", rpos, rbase, qbase);
 #ifndef MATCH_ONLY
-			// Maybe [KMAT][0]?
-			// mismatching cons-ins
-			incr_kmer(bed_itr, rpos, kmer, KINS, 0, qqual);
+			// TYPE: ins-substitution
+			//incr_kmer(bed_itr, rpos, kmer, KINS, 0, qqual);
+			incr_kmer2(bed_itr, rpos, kmer, K_MIS_I, 0, qqual);
 #endif
 		    }
 		} else {
 		    if (V) printf("I  %ld\t. %c *\n", rpos, qbase);
 #ifndef MATCH_ONLY
-		    // ins vs cons
-		    incr_kmer(bed_itr, rpos, kmer, KINS, 0, qqual);
+		    // TYPE: overcall (no insertion in cons)
+		    //incr_kmer(bed_itr, rpos, kmer, KINS, 0, qqual);
+		    incr_kmer2(bed_itr, rpos, kmer, K_OVER, 0, qqual);
 #endif
 		}
 		qpos++;
@@ -346,17 +636,19 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, hts_pos_t *map,
 		break;
 
 	    case BAM_CDEL:
-		if (rbase == '*') {
+		if (rbase == '*' || islower(rbase)) {
 		    if (V>1) printf("md %ld\t%c .\n", rpos, rbase);
 #ifndef MATCH_ONLY
-		    // del matching cons-del
-		    incr_kmer(bed_itr, rpos, kmer, KDEL, 1, qqual);
+		    // TYPE: del-match
+		    //incr_kmer(bed_itr, rpos, kmer, KDEL, 1, qqual);
+		    incr_kmer2(bed_itr, rpos, kmer, K_MAT_D, 1, qqual);
 #endif
 		} else {
 		    if (V) printf("D  %ld\t%c . *\n", rpos, rbase);
 #ifndef MATCH_ONLY
-		    // del vs cons-base
-		    incr_kmer(bed_itr, rpos, kmer, KDEL, 0, qqual);
+		    // TYPE: undercall
+		    //incr_kmer(bed_itr, rpos, kmer, KDEL, 0, qqual);
+		    incr_kmer2(bed_itr, rpos, kmer, K_UNDER, 0, qqual);
 #endif
 		}
 		rpos++;
@@ -380,6 +672,8 @@ void dump_kmers(void) {
 	// combine all "pass" states into a single count during analysis
 	// and only have "fail" states for the separate types, but this is
 	// left to future exploration.
+	//
+	// Q: should we still do this however for I and D states?
 	int cnt =
 	    kmer_count[i][0][0]+kmer_count[i][0][1] +
 	    kmer_count[i][1][0]+kmer_count[i][1][1] +
@@ -390,11 +684,14 @@ void dump_kmers(void) {
 	int all_mis = 0;
 	double all_err = 0;
 	for (k = 0; k < 3; k++) {
+	    if (!(kmer_count[i][k][0]+kmer_count[i][k][1]))
+		continue;
+
 	    for (j = WIN_LEN-1; j >= 0; j--)
 		putchar("ACGTNNNN"[(i>>(j*3))&7]);
 	    double err = cnt ? (double)kmer_count[i][k][0] / cnt : 0;
 	    int qval = err ? -10*log10(err)+.5 : 99;
-	    printf("\t%c\t%d\t%d\t%d\t%d\n",
+	    printf("\t%c\t%12d\t%12d\t%d\t%d\n",
 		   "MID"[k], kmer_count[i][k][0], cnt, qval,
 		   (int)(-4.343*log(kmer_qual[i][k]/cnt)+.5));
 
@@ -407,8 +704,87 @@ void dump_kmers(void) {
 	    putchar("ACGTNNNN"[(i>>(j*3))&7]);
 	double err = all_mis ? (double)all_mis / cnt : 0;
 	int qval = err ? -10*log10(err)+.5 : 99;
-	printf("\t?\t%d\t%d\t%d\t%d\n", all_mis, cnt, qval,
+	printf("\t?\t%12d\t%12d\t%d\t%d\n", all_mis, cnt, qval,
 	       (int)(-4.343*log(all_err/cnt)+.5));
+    }
+}
+
+// TODO: compare k_count[i][M_MAT_M] with K_MAT_I/D to see if the ratios
+// of false to true agree.  The discrepancy represents possible alignment
+// artefacts (ref bias, errors) or consensus call inaccuracies.
+void dump_kmers2(void) {
+    int i, j, k;
+    puts("=== kmers ===\n");
+    for (i = 0; i <= WIN_MASK; i++) {
+	// For now skip kmers containing N.  We gathered stats, but I'm
+	// not sure what to do with them.
+	for (j = 0; j < WIN_LEN; j++)
+	    if (((i >> (j*3))&4) == 4)
+		break;
+	if (j < WIN_LEN)
+	    continue;
+
+	// K_MAT_[MID] are all matches, but for M, I and D cigar ops.
+	// (Eg cons is I and seq is I and sequences match).
+	// So this is the total of "good".
+
+	// K_MIS_[MI] are matching cigar ops (eg both cons/seq is I) but
+	// a substitution error.
+
+	// K_OVER and K_UNDER represent cigar op issues where cons/seq
+	// differ on the number of base calls
+	int ntrue = k_count[i][K_MAT_M] 
+	          + k_count[i][K_MAT_I]
+	          + k_count[i][K_MAT_D];
+	int nsub  = k_count[i][K_MIS_M]
+	          + k_count[i][K_MIS_I];
+	int nunder= k_count[i][K_UNDER];
+	int nover = k_count[i][K_OVER];
+
+	int ntot  = ntrue + nsub + nunder + nover;
+
+	if (!ntot)
+	    continue;
+
+	for (k = 0; k < 3; k++) {
+	    int nerr, ncnt = nsub + ntrue, ncnt2;
+	    double qerr;
+	    switch (k) {
+	    case 0:
+		nerr = nsub;
+		qerr = k_qual[i][K_MAT_M]
+		     + k_qual[i][K_MAT_I]
+		     + k_qual[i][K_MAT_D]
+		     + k_qual[i][K_MIS_M]
+		     + k_qual[i][K_MIS_I];
+		ncnt2 = ncnt;
+		break;
+	    case 1:
+		nerr = nunder;
+		ncnt += (ncnt2 = nunder);
+		qerr = k_qual[i][K_UNDER];
+		break;
+	    case 2:
+		nerr = nover;
+		ncnt += (ncnt2 = nover);
+		qerr = k_qual[i][K_OVER];
+		break;
+	    }
+
+	    if (!ncnt2)
+		continue;
+
+	    double err = (double)nerr / ncnt;
+	    int qreal = err ? -10*log10(err)+.5 : 99;
+	    int qcall = (int)(-4.343*log(qerr / ncnt)+.5);
+	    char *s[] = {"MATCH", "OVER", "UNDER"};
+
+	    for (j = WIN_LEN-1; j >= 0; j--)
+		putchar("ACGTNNNN"[(i>>(j*3))&7]);
+	    printf("\t%s\t%12d\t%12d\t%d\t%d\n",
+		   s[k], nerr, ncnt, qreal, qcall);
+	    
+	}
     }
 }
 
@@ -417,6 +793,7 @@ int main(int argc, char **argv) {
     sam_hdr_t *hdr = NULL;
     htsFormat in_fmt = {0};
     faidx_t *fai = NULL;
+    int mark_ins = 0;
     hts_pos_t *map = NULL;
     bam1_t *b = bam_init1();
     uint8_t *ref = NULL;
@@ -426,17 +803,20 @@ int main(int argc, char **argv) {
     hts_itr_t *itr = NULL;
 
     int c;
-    while ((c = getopt(argc, argv, "I:f:b:r:")) >= 0) {
+    while ((c = getopt(argc, argv, "I:f:b:r:m")) >= 0) {
 	switch(c) {
 	case 'I': hts_parse_format(&in_fmt, optarg); break;
 
-	case 'f': {
+	case 'f':
 	    if (!(fai = fai_load(optarg))) {
 		fprintf(stderr, "Failed to load consensus fasta\n");
 		goto err;
 	    }
 	    break;
-	}
+
+	case 'm':
+	    mark_ins = 1;
+	    break;
 	    
 	case 'b':
 	    bed = regidx_init(optarg, NULL, NULL, 0, NULL);
@@ -507,13 +887,13 @@ int main(int argc, char **argv) {
 		goto err;
 	    if (map)
 		free(map);
-	    if (!(map = build_ref_map(ref, ref_len)))
+	    if (!(map = build_ref_map(ref, &ref_len, mark_ins)))
 		goto err;
 	    last_tid = b->core.tid;
 	}
 	//puts(bam_get_qname(b));
 
-	accumulate_kmers(hdr, ref, map, b, bed, bed_itr);
+	accumulate_kmers(hdr, ref, map, b, bed, bed_itr, mark_ins);
     }
     if (r != -1)
 	goto err;
@@ -529,7 +909,8 @@ int main(int argc, char **argv) {
     if (bed_itr) regitr_destroy(bed_itr);
     if (itr) hts_itr_destroy(itr);
 
-    dump_kmers();
+    //dump_kmers();
+    dump_kmers2();
 
     return 0;
 
