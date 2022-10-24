@@ -191,7 +191,7 @@ double Perr[256];
  *    Lowercase = insertion
  *
  * If mark_ins is non-zero then we assume it to be a samtools consensus
- * file produced with --show-del yes --mark-ins.
+ * file produced with -a --show-del yes --mark-ins.
  *    * = homozygous deletion
  *    _ = next base is insertion (_ as + is probelmatic at start of a line)
  *    Lowercase = heterozygous indel
@@ -401,31 +401,42 @@ static inline void incr_kmer2(regitr_t *bed_itr, hts_pos_t rpos,
     int ok2 = type<K_WRONG;
     assert(ok == ok2);
     
-//    printf("Incr %05o %c %d %d\n", kmer, "MID"[type], ok, qual);
+    //printf("Incr %05o %c %d %d %d\n", kmer, "MID"[type], ok, qual, type);
 
     if (in_bed(bed_itr, rpos)) {
 	// Keep list of last WIN_LEN/2 kmers added (if OK), so we can
 	// undo them if we add a not-OK one.  Similarly track the numeber
 	// of subsequent kmers to skip (if OK).
+	int skipped;
 	if (kmer_skip && ok) {
 	    kmer_skip--;
+	    skipped=1;
 	    //printf("Skip %05o\n", kmer);
 	} else {
 	    k_count[kmer][type]++;
 	    k_qual[kmer][type] += Perr[qual];
+	    skipped=0;
 	}
 
 	// Revert to ignore
 	if (!ok) {
 	    for (int i = 0; i < WIN_LEN/2; i++) {
+		//printf("Reset %05o to ignore, count %d type %d\n",
+		//       kmer_hist_kmer[i],
+		//       k_count[kmer_hist_kmer[i]][kmer_hist_type[i]],
+		//       kmer_hist_type[i]);
 		int h_ok = kmer_hist_type[i] < K_WRONG;
 		if (h_ok) {
 		    k_count[kmer_hist_kmer[i]][kmer_hist_type[i]]--;
 		    k_qual [kmer_hist_kmer[i]][kmer_hist_type[i]]
 			-= kmer_hist_qual[i];
+		    if (k_count[kmer_hist_kmer[i]][kmer_hist_type[i]] > 2000000000) {
+			fflush(stdout);
+			fflush(stderr);
+			exit(1);
+		    }
 		}
 		kmer_hist_type[i] = 99; // prevent double decr is more err
-		//printf("Reset %05o to ignore\n", kmer_hist_kmer[i]);
 	    }
 	    kmer_skip = WIN_LEN/2;
 	}
@@ -433,7 +444,8 @@ static inline void incr_kmer2(regitr_t *bed_itr, hts_pos_t rpos,
 	// cache
 	int idx = kmer_num % (WIN_LEN/2); // could also round and AND
 	kmer_hist_kmer[idx] = kmer;
-	kmer_hist_type[idx] = type;
+	kmer_hist_type[idx] = skipped ? 99 : type;
+	//printf("type[%05o,%d] = %d / %d\n", kmer, idx, type, kmer_hist_type[idx]);
 	kmer_hist_qual[idx] = Perr[qual];
 	kmer_num++;
     } else {
@@ -777,8 +789,9 @@ void dump_kmers2(void) {
 	    double err = (double)nerr / ncnt;
 	    int qreal = err ? -10*log10(err)+.5 : 99;
 	    int qcall = (int)(-4.343*log(qerr / ncnt)+.5);
-	    char *s[] = {"MATCH", "OVER", "UNDER"};
+	    char *s[] = {"MATCH", "UNDER", "OVER"};
 
+	    printf("%05o ", i);
 	    for (j = WIN_LEN-1; j >= 0; j--)
 		putchar("ACGTNNNN"[(i>>(j*3))&7]);
 	    printf("\t%s\t%12d\t%12d\t%d\t%d\n",
