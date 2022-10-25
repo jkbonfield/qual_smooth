@@ -149,10 +149,19 @@ This gives us easier matching of nth base of insertion vs nth pos in ref.
 #define K_CAT "MIDxiou"
 uint32_t (*k_count)[K_NCAT] = NULL;
 double   (*k_qual) [K_NCAT] = NULL;
+double   (*k_qual2)[K_NCAT][99] = NULL;
+
+#define ST_HALO 50 // distance from indel
+#define ST_NEAR_INS 1
+#define ST_NEAR_DEL 2
+#define ST_NEAR_STR 4
+
+
 
 // [4<<WIN_LEN][TYPE][IS_CORRECT]  (type being match, ins and del)
 uint32_t (*kmer_count)[3][2] = NULL; // counts of true and false bases
 double   (*kmer_qual)[3] = NULL;     // sum of estimated errors from qual
+int      (*kmer_qual2)[3][99] = NULL;     // sum of estimated errors from qual
 #define WIN_LEN 5
 #define WIN_SHIFT 0 // +ve => move right
 #define WIN_MASK ((1<<(3*WIN_LEN))-1)
@@ -202,7 +211,8 @@ double Perr[256];
  *    Top bit set = insertion.
  *    Top-bit "lowercase" = heterozygous insertion (1 allele inserted)
  */
-hts_pos_t *build_ref_map(uint8_t *ref, hts_pos_t *len_p, int mark_ins) {
+hts_pos_t *build_ref_map(uint8_t *ref, hts_pos_t *len_p, uint8_t *stat,
+			 int mark_ins) {
     hts_pos_t len = *len_p;
     hts_pos_t *map = malloc((len+1) * sizeof(*map));
     if (!map)
@@ -216,6 +226,17 @@ hts_pos_t *build_ref_map(uint8_t *ref, hts_pos_t *len_p, int mark_ins) {
 		map[r++] = i;
 	    else if (islower(ref[i]))
 		ref[i] = toupper(ref[i]) | 0x80; // internal marker for ins
+
+	    if (ref[i] == '*') {
+		for (int z = -ST_HALO; z <= ST_HALO; z++)
+		    if (i+z >= 0 && i+z < len)
+			stat[i+z] |= ST_NEAR_DEL;
+	    }
+	    if (ref[i] & 0x80) {
+		for (int z = -ST_HALO; z <= ST_HALO; z++)
+		    if (i+z >= 0 && i+z < len)
+			stat[i+z] |= ST_NEAR_INS;
+	    }
 	}
     } else {
 	// TODO use qual and have a filter for ref bases to skip.
@@ -223,9 +244,18 @@ hts_pos_t *build_ref_map(uint8_t *ref, hts_pos_t *len_p, int mark_ins) {
 	for (i = k = r = 0; i < len; i++) {
 	    if (ref[i] == '_') {
 		ref[k++] = ref[++i] | 0x80; // mark insertion
+		for (int z = -ST_HALO; z <= ST_HALO; z++)
+		    if (k+z >= 0 && k+z < len)
+			stat[k+z] |= ST_NEAR_INS;
 	    } else {
 		map[r++] = k;
 		ref[k++] = ref[i];
+
+		if (islower(ref[i])) {
+		for (int z = -ST_HALO; z <= ST_HALO; z++)
+		    if (k+z >= 0 && k+z < len)
+			stat[k+z] |= ST_NEAR_DEL;
+		}
 	    }
 	}
 	*len_p = k;
@@ -350,6 +380,7 @@ int kmer_hist_kmer[WIN_LEN/2];
 int kmer_hist_type[WIN_LEN/2];
 int kmer_hist_ok[WIN_LEN/2];
 double kmer_hist_qual[WIN_LEN/2];
+int kmer_hist_qual2[WIN_LEN/2];
 int64_t kmer_num = 0;
 
 static inline void incr_kmer(regitr_t *bed_itr, hts_pos_t rpos,
@@ -367,6 +398,7 @@ static inline void incr_kmer(regitr_t *bed_itr, hts_pos_t rpos,
 	} else {
 	    kmer_count[kmer][type][ok]++;
 	    kmer_qual[kmer][type] += Perr[qual];
+	    kmer_qual2[kmer][type][qual]++;
 	}
 
 	// Revert to ignore
@@ -380,6 +412,7 @@ static inline void incr_kmer(regitr_t *bed_itr, hts_pos_t rpos,
 		kmer_count[kmer_hist_kmer[i]][kmer_hist_type[i]][h_ok]--;
 		kmer_qual [kmer_hist_kmer[i]][kmer_hist_type[i]]
 		    -= kmer_hist_qual[i];
+		kmer_qual2[kmer_hist_kmer[i]][kmer_hist_type[i]][kmer_hist_qual2[i]]--;
 		kmer_hist_ok[i] = 0; // prevent another decr on next-err
 		//printf("Reset %05o to ignore\n", kmer_hist_kmer[i]);
 	    }
@@ -392,15 +425,19 @@ static inline void incr_kmer(regitr_t *bed_itr, hts_pos_t rpos,
 	kmer_hist_type[idx] = type;
 	kmer_hist_ok  [idx] = ok;
 	kmer_hist_qual[idx] = Perr[qual];
+	kmer_hist_qual2[idx] = qual;
 	kmer_num++;
     }
 }
 
-static inline void incr_kmer2(regitr_t *bed_itr, hts_pos_t rpos,
+static inline void incr_kmer2(regitr_t *bed_itr, uint8_t stat, hts_pos_t rpos,
 			      uint32_t kmer, int type, int ok, int qual) {
     int ok2 = type<K_WRONG;
     assert(ok == ok2);
     
+//    if (stat) // not near an indel
+//	return;
+
 //    printf("Incr %05o %c %d %d %d\n", kmer, K_CAT[type], ok, qual, type);
     if (in_bed(bed_itr, rpos)) {
 	// Keep list of last WIN_LEN/2 kmers added (if OK), so we can
@@ -414,6 +451,9 @@ static inline void incr_kmer2(regitr_t *bed_itr, hts_pos_t rpos,
 	} else {
 	    k_count[kmer][type]++;
 	    k_qual[kmer][type] += Perr[qual];
+	    k_qual2[kmer][type][qual]++;
+//	    if (kmer == 031022 && type == K_OVER)
+//		printf("31022: overcall with qual %d\n", qual);
 	    skipped=0;
 	}
 
@@ -430,6 +470,7 @@ static inline void incr_kmer2(regitr_t *bed_itr, hts_pos_t rpos,
 		    k_count[kmer_hist_kmer[i]][kmer_hist_type[i]]--;
 		    k_qual [kmer_hist_kmer[i]][kmer_hist_type[i]]
 			-= kmer_hist_qual[i];
+		    k_qual2[kmer_hist_kmer[i]][kmer_hist_type[i]][kmer_hist_qual2[i]]--;
 		    if (k_count[kmer_hist_kmer[i]][kmer_hist_type[i]] > 2000000000) {
 			fflush(stdout);
 			fflush(stderr);
@@ -447,6 +488,7 @@ static inline void incr_kmer2(regitr_t *bed_itr, hts_pos_t rpos,
 	kmer_hist_type[idx] = skipped ? 99 : type;
 	//printf("type[%05o,%d] = %d / %d\n", kmer, idx, type, kmer_hist_type[idx]);
 	kmer_hist_qual[idx] = Perr[qual];
+	kmer_hist_qual2[idx] = qual;
 	kmer_num++;
     } else {
 	// TODO: set kmer_hist_type to 99.  Optimise this as only
@@ -456,7 +498,8 @@ static inline void incr_kmer2(regitr_t *bed_itr, hts_pos_t rpos,
     }
 }
 
-void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, hts_pos_t *map,
+void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref,
+		      const uint8_t *stat, hts_pos_t *map,
 		      bam1_t *b, regidx_t *bed, regitr_t *bed_itr,
 		      int mark_ins) { 
     const int V=0; // DEBUG only
@@ -476,6 +519,7 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, hts_pos_t *map,
 
 	kmer_count = calloc(WIN_MASK+1, sizeof(*kmer_count));
 	kmer_qual  = malloc((WIN_MASK+1) * sizeof(*kmer_qual));
+	kmer_qual2 = calloc((WIN_MASK+1), sizeof(*kmer_qual2));
 	int i, j, k;
 	for (k = 0; k < WIN_MASK; k++)
 	    for (j = 0; j < 3; j++)
@@ -483,6 +527,7 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, hts_pos_t *map,
 
 	k_count = calloc(WIN_MASK+1, sizeof(*k_count));
 	k_qual  = calloc(WIN_MASK+1, sizeof(*k_qual));
+	k_qual2 = calloc(WIN_MASK+1, sizeof(*k_qual2));
 	for (k = 0; k < WIN_MASK; k++)
 	    for (j = 0; j < K_NCAT; j++)
 		kmer_qual[k][j] = DBL_MIN;
@@ -525,6 +570,7 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, hts_pos_t *map,
 	    uint8_t qbase = seq_nt16_str[bam_seqi(qseq, qpos)];
 	    uint8_t qqual = qual[qpos];
 	    uint8_t rbase = ref[map[rpos]+nth];
+	    uint8_t rst   = stat[map[rpos]+nth];
 
 	    uint32_t kmer = context_i(b, qpos);
 	    if (V>1) printf("%.5s\t%05o\t", context_s(b, qpos), kmer);
@@ -545,7 +591,7 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, hts_pos_t *map,
 #ifndef MATCH_ONLY
 		    // TYPE: undercall (cons has an insertion, we did not)
 		    //incr_kmer(bed_itr, rpos, kmer, KDEL, 0, qqual);
-		    incr_kmer2(bed_itr, rpos, kmer, K_UNDER, 0, qqual);
+		    incr_kmer2(bed_itr, rst, rpos, kmer, K_UNDER, 0, qqual);
 #endif
 		} else {
 		    if (qbase == ambig(rbase, qbase)) {
@@ -553,14 +599,14 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, hts_pos_t *map,
 			    printf("M  %ld\t%c %c\n", rpos, rbase, qbase);
 			// TYPE: match-match
 			//incr_kmer(bed_itr, rpos, kmer, KMAT, 1, qqual);
-			incr_kmer2(bed_itr, rpos, kmer, K_MAT_M, 1, qqual);
+			incr_kmer2(bed_itr, rst, rpos, kmer, K_MAT_M, 1, qqual);
 		    } else if (rbase == '*') {
 			if (V)
 			    printf("im %ld\t%c %c *\n", rpos, rbase, qbase);
 #ifndef MATCH_ONLY
 			// TYPE: overcall
 			//incr_kmer(bed_itr, rpos, kmer, KINS, 0, qqual);
-			incr_kmer2(bed_itr, rpos, kmer, K_OVER, 0, qqual);
+			incr_kmer2(bed_itr, rst, rpos, kmer, K_OVER, 0, qqual);
 #endif
 		    } else if (rbase != 'N') {
 			if (V) {
@@ -571,7 +617,7 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, hts_pos_t *map,
 
 			// TYPE: substitution
 			//incr_kmer(bed_itr, rpos, kmer, KMAT, 0, qqual);
-			incr_kmer2(bed_itr, rpos, kmer, K_MIS_M, 0, qqual);
+			incr_kmer2(bed_itr, rst, rpos, kmer, K_MIS_M, 0, qqual);
 		    }
 		}
 
@@ -620,7 +666,7 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, hts_pos_t *map,
 #ifndef MATCH_ONLY
 			// TYPE: undercall (cons had insertion, we did not)
 			//incr_kmer(bed_itr, rpos, kmer, KDEL, 0, qqual);
-			incr_kmer2(bed_itr, rpos, kmer, K_UNDER, 0, qqual);
+			incr_kmer2(bed_itr, rst, rpos, kmer, K_UNDER, 0, qqual);
 #endif
 		    }
 		}
@@ -636,14 +682,14 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, hts_pos_t *map,
 #ifndef MATCH_ONLY
 			// TYPE: ins-match
 			//incr_kmer(bed_itr, rpos, kmer, KINS, 1, qqual);
-			incr_kmer2(bed_itr, rpos, kmer, K_MAT_I, 1, qqual);
+			incr_kmer2(bed_itr, rst, rpos, kmer, K_MAT_I, 1, qqual);
 #endif
 		    } else {
 			if (V>1) printf("xi %ld\t%c %c\n", rpos, rbase, qbase);
 #ifndef MATCH_ONLY
 			// TYPE: ins-substitution
 			//incr_kmer(bed_itr, rpos, kmer, KINS, 0, qqual);
-			incr_kmer2(bed_itr, rpos, kmer, K_MIS_I, 0, qqual);
+			incr_kmer2(bed_itr, rst, rpos, kmer, K_MIS_I, 0, qqual);
 #endif
 		    }
 		} else {
@@ -651,7 +697,7 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, hts_pos_t *map,
 #ifndef MATCH_ONLY
 		    // TYPE: overcall (no insertion in cons)
 		    //incr_kmer(bed_itr, rpos, kmer, KINS, 0, qqual);
-		    incr_kmer2(bed_itr, rpos, kmer, K_OVER, 0, qqual);
+		    incr_kmer2(bed_itr, rst, rpos, kmer, K_OVER, 0, qqual);
 #endif
 		}
 		qpos++;
@@ -664,14 +710,14 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, hts_pos_t *map,
 #ifndef MATCH_ONLY
 		    // TYPE: del-match
 		    //incr_kmer(bed_itr, rpos, kmer, KDEL, 1, qqual);
-		    incr_kmer2(bed_itr, rpos, kmer, K_MAT_D, 1, qqual);
+		    incr_kmer2(bed_itr, rst, rpos, kmer, K_MAT_D, 1, qqual);
 #endif
 		} else {
 		    if (V) printf("D  %ld\t%c . *\n", rpos, rbase);
 #ifndef MATCH_ONLY
 		    // TYPE: undercall
 		    //incr_kmer(bed_itr, rpos, kmer, KDEL, 0, qqual);
-		    incr_kmer2(bed_itr, rpos, kmer, K_UNDER, 0, qqual);
+		    incr_kmer2(bed_itr, rst, rpos, kmer, K_UNDER, 0, qqual);
 #endif
 		}
 		rpos++;
@@ -772,25 +818,38 @@ void dump_kmers2(void) {
 	for (k = 0; k < 3; k++) {
 	    int nerr, ncnt = nsub + ntrue, ncnt2;
 	    double qerr;
+	    qerr = k_qual[i][K_MAT_M]
+		+ k_qual[i][K_MAT_I]
+		+ k_qual[i][K_MAT_D]
+		+ k_qual[i][K_MIS_M]
+		+ k_qual[i][K_MIS_I];
+	    double qerr2 = 0;
+	    for (int z = 99; z >= 0; z--) {
+		qerr2 += Perr[z]*k_qual2[i][K_MAT_M][z];
+		qerr2 += Perr[z]*k_qual2[i][K_MAT_I][z];
+		qerr2 += Perr[z]*k_qual2[i][K_MAT_D][z];
+		qerr2 += Perr[z]*k_qual2[i][K_MAT_M][z];
+		qerr2 += Perr[z]*k_qual2[i][K_MIS_M][z];
+		qerr2 += Perr[z]*k_qual2[i][K_MIS_I][z];
+	    }
 	    switch (k) {
 	    case 0:
 		nerr = nsub;
-		qerr = k_qual[i][K_MAT_M]
-		     + k_qual[i][K_MAT_I]
-		     + k_qual[i][K_MAT_D]
-		     + k_qual[i][K_MIS_M]
-		     + k_qual[i][K_MIS_I];
 		ncnt2 = ncnt;
 		break;
 	    case 1:
 		nerr = nunder;
 		ncnt += (ncnt2 = nunder);
-		qerr = k_qual[i][K_UNDER];
+		qerr += k_qual[i][K_UNDER];
+		for (int z = 99; z >= 0; z--)
+		    qerr2 += Perr[z]*k_qual2[i][K_UNDER][z];
 		break;
 	    case 2:
 		nerr = nover;
 		ncnt += (ncnt2 = nover);
-		qerr = k_qual[i][K_OVER];
+		qerr += k_qual[i][K_OVER];
+		for (int z = 99; z >= 0; z--)
+		    qerr2 += Perr[z]*k_qual2[i][K_OVER][z];
 		break;
 	    }
 
@@ -800,13 +859,14 @@ void dump_kmers2(void) {
 	    double err = (double)nerr / ncnt;
 	    int qreal = err ? -10*log10(err)+.5 : 99;
 	    int qcall = (int)(-4.343*log(qerr / ncnt)+.5);
+	    int qcall2 = (int)(-4.343*log(qerr2 / ncnt)+.5);
 	    char *s[] = {"MATCH", "UNDER", "OVER"};
 
 	    printf("%05o ", i);
 	    for (j = WIN_LEN-1; j >= 0; j--)
 		putchar("ACGTNNNN"[(i>>(j*3))&7]);
-	    printf("\t%s\t%12d\t%12d\t%d\t%d\n",
-		   s[k], nerr, ncnt, qreal, qcall);
+	    printf("\t%s\t%12d\t%12d\t%d\t%d\t%d\n",
+		   s[k], nerr, ncnt, qreal, qcall,qcall2);
 	    
 	}
     }
@@ -821,6 +881,7 @@ int main(int argc, char **argv) {
     hts_pos_t *map = NULL;
     bam1_t *b = bam_init1();
     uint8_t *ref = NULL;
+    uint8_t *stat = NULL; // status bits
     regidx_t *bed = NULL;
     regitr_t *bed_itr = NULL;
     char *reg = NULL;
@@ -907,17 +968,20 @@ int main(int argc, char **argv) {
 	    ref = (uint8_t *)
 		faidx_fetch_seq64(fai, sam_hdr_tid2name(hdr, b->core.tid),
 				  0, HTS_POS_MAX, &ref_len);
-	    if (!ref)
+	    if (stat)
+		free(stat);
+	    stat = (uint8_t *)calloc(ref_len, sizeof(*stat));
+	    if (!ref || !stat)
 		goto err;
 	    if (map)
 		free(map);
-	    if (!(map = build_ref_map(ref, &ref_len, mark_ins)))
+	    if (!(map = build_ref_map(ref, &ref_len, stat, mark_ins)))
 		goto err;
 	    last_tid = b->core.tid;
 	}
 	//puts(bam_get_qname(b));
 
-	accumulate_kmers(hdr, ref, map, b, bed, bed_itr, mark_ins);
+	accumulate_kmers(hdr, ref, stat, map, b, bed, bed_itr, mark_ins);
     }
     if (r != -1)
 	goto err;
@@ -928,6 +992,7 @@ int main(int argc, char **argv) {
     bam_destroy1(b);
     fai_destroy(fai);
     if (ref) free(ref);
+    if (stat) free(stat);
     if (map) free(map);
     if (bed) regidx_destroy(bed);
     if (bed_itr) regitr_destroy(bed_itr);
