@@ -401,8 +401,7 @@ static inline void incr_kmer2(regitr_t *bed_itr, hts_pos_t rpos,
     int ok2 = type<K_WRONG;
     assert(ok == ok2);
     
-    //printf("Incr %05o %c %d %d %d\n", kmer, "MID"[type], ok, qual, type);
-
+//    printf("Incr %05o %c %d %d %d\n", kmer, K_CAT[type], ok, qual, type);
     if (in_bed(bed_itr, rpos)) {
 	// Keep list of last WIN_LEN/2 kmers added (if OK), so we can
 	// undo them if we add a not-OK one.  Similarly track the numeber
@@ -411,7 +410,7 @@ static inline void incr_kmer2(regitr_t *bed_itr, hts_pos_t rpos,
 	if (kmer_skip && ok) {
 	    kmer_skip--;
 	    skipped=1;
-	    //printf("Skip %05o\n", kmer);
+//	    printf("Skip %05o\n", kmer);
 	} else {
 	    k_count[kmer][type]++;
 	    k_qual[kmer][type] += Perr[qual];
@@ -421,11 +420,12 @@ static inline void incr_kmer2(regitr_t *bed_itr, hts_pos_t rpos,
 	// Revert to ignore
 	if (!ok) {
 	    for (int i = 0; i < WIN_LEN/2; i++) {
-		//printf("Reset %05o to ignore, count %d type %d\n",
-		//       kmer_hist_kmer[i],
-		//       k_count[kmer_hist_kmer[i]][kmer_hist_type[i]],
-		//       kmer_hist_type[i]);
 		int h_ok = kmer_hist_type[i] < K_WRONG;
+//		printf("%s %05o to ignore, count %d type %d\n",
+//		       h_ok ? "Reset" : "RDone",
+//		       kmer_hist_kmer[i],
+//		       k_count[kmer_hist_kmer[i]][kmer_hist_type[i]],
+//		       kmer_hist_type[i]);
 		if (h_ok) {
 		    k_count[kmer_hist_kmer[i]][kmer_hist_type[i]]--;
 		    k_qual [kmer_hist_kmer[i]][kmer_hist_type[i]]
@@ -582,13 +582,23 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, hts_pos_t *map,
 		// absent here, then we have 5 deletion kmers to mark up,
 		// not just the one.
 		// TODO: (we should have started earlier then)
+
+		// TODO ref pos 9918843 on ONT test.
+		// Here cons is G(*/T)TTTTTTC, so 1 het ins and
+		// map[rpos+1]-map[rpos]-1 = 1 (1bp extra).
+		// BUT: our next cig op is 1D, so we should have +0 or +1
+		// base insertion, but have 1 del.
+		//
+		// Ie if this was HOM INS, it'd be ndel=2, despite
+		// map[rpos+1]-map[rpos]-1 being 1, as we have to add
+		// the D in too.  Maybe that's covered by CDEL below?
 		if (ndel || (map[rpos+1] - map[rpos] != 1 && i < ncig &&
 			     !(bam_cigar_op(cig[i+1]) == BAM_CINS ||
 			       bam_cigar_op(cig[i+1]) == BAM_CPAD))) {
 		    // Nominal deletion length
 		    if (!ndel)
 			ndel = map[rpos+1] - map[rpos] - 1 - WIN_LEN/2;
-		    ndel--;
+		    ndel-=(ndel>0);
 
 		    // 2nd alternative length based on heterozyugous ins
 		    // to consensus
@@ -602,6 +612,7 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, hts_pos_t *map,
 		    // May wish to check the one that closest matches the
 		    // next cigar op.
 		    ndel = MIN(ndel,ndel2);
+		    if (ndel < 0) ndel = 0; // seq-D next to cons-I
 
 		    if (ndel) {
 			if (V)
