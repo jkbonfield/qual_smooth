@@ -819,16 +819,15 @@ void dump_kmers2(void) {
 	if (!ntot)
 	    continue;
 
-	for (k = 0; k < 3; k++) {
-	    int nerr;
+	for (k = 0; k < 5; k++) {
+	    int nerr, ncnt;
 	    double qerr;
 	    qerr = k_qual[i][K_MAT_M]
 		+ k_qual[i][K_MAT_I]
 		+ k_qual[i][K_MAT_D]
 		+ k_qual[i][K_MIS_M]
 		+ k_qual[i][K_MIS_I];
-	    double qerr2 = 0, qerr3 = 0;
-	    int qerr3_c = 0;
+	    double qerr2 = 0;
 	    for (int z = 99; z >= 0; z--) {
 		// amortised phred error score
 		qerr2 += Perr[z]*k_qual2[i][K_MAT_M][z];
@@ -837,17 +836,8 @@ void dump_kmers2(void) {
 		qerr2 += Perr[z]*k_qual2[i][K_MAT_M][z];
 		qerr2 += Perr[z]*k_qual2[i][K_MIS_M][z];
 		qerr2 += Perr[z]*k_qual2[i][K_MIS_I][z];
-
-		// Somewhat meaningless average phred qual.
-		// Not helpful, but average qual is often quoted.
-		// I should probably discard this again.
-		qerr3 += z*k_qual2[i][K_MAT_M][z]; qerr3_c += k_qual2[i][K_MAT_M][z];
-		qerr3 += z*k_qual2[i][K_MAT_I][z]; qerr3_c += k_qual2[i][K_MAT_I][z];
-		qerr3 += z*k_qual2[i][K_MAT_D][z]; qerr3_c += k_qual2[i][K_MAT_D][z];
-		qerr3 += z*k_qual2[i][K_MAT_M][z]; qerr3_c += k_qual2[i][K_MAT_M][z];
-		qerr3 += z*k_qual2[i][K_MIS_M][z]; qerr3_c += k_qual2[i][K_MIS_M][z];
-		qerr3 += z*k_qual2[i][K_MIS_I][z]; qerr3_c += k_qual2[i][K_MIS_I][z];
 	    }
+	    ncnt = ntot;
 	    switch (k) {
 	    case 0:
 		nerr = nsubst;
@@ -855,51 +845,60 @@ void dump_kmers2(void) {
 	    case 1:
 		nerr = nunder;
 		qerr += k_qual[i][K_UNDER];
-		for (int z = 99; z >= 0; z--) {
+		for (int z = 99; z >= 0; z--)
 		    qerr2 += Perr[z]*k_qual2[i][K_UNDER][z];
-		    qerr3 += z*k_qual2[i][K_UNDER][z];
-		    qerr3_c += k_qual2[i][K_UNDER][z];
-		}
 		break;
 	    case 2:
 		nerr = nover;
 		qerr += k_qual[i][K_OVER];
-		for (int z = 99; z >= 0; z--) {
+		for (int z = 99; z >= 0; z--)
 		    qerr2 += Perr[z]*k_qual2[i][K_OVER][z];
-		    qerr3 += z*k_qual2[i][K_OVER][z];
-		    qerr3_c += k_qual2[i][K_OVER][z];
-		}
 		break;
 
-	    case 3:
-		// Unused (see loop end), but shows seq vs cons match
-		// where both are in CIGAR I op.  The sample size will be
-		// small, but this can potentially show reference bias as
-		// the data matches the truth set, but we may have many
-		// misaligned reads due to them ended near the insertion.
+
+	    // Looking for reference bias.
+	    // Compare substitution errors in places where sample and cons
+	    // are in sync, but both cigar-Ms vs both cigar-Is.
+	    // A cigar-I match here is where the consensus is insertion
+	    // as well as sample (FIXME: limit to homozygous only?), but
+	    // the reference doesn't have this base.
+	    // If there is a difference, it's due to alignment artifacts
+	    // instead.
+	    case 3: // match in M cigar ops only
 		qerr = qerr2 = 0;
+		qerr = k_qual[i][K_MAT_M] + k_qual[i][K_MIS_M];
+		for (int z = 99; z >= 0; z--) {
+		    qerr2 += Perr[z]*k_qual2[i][K_MAT_M][z];
+		    qerr2 += Perr[z]*k_qual2[i][K_MIS_M][z];
+		}
+		nerr = k_count[i][K_MIS_M];
+		ncnt = k_count[i][K_MIS_M] + k_count[i][K_MAT_M];
+		break;
+	    case 4: // match in I cigar ops only
+		qerr = qerr2 = 0;
+		qerr = k_qual[i][K_MAT_I] + k_qual[i][K_MIS_I];
 		for (int z = 99; z >= 0; z--) {
 		    qerr2 += Perr[z]*k_qual2[i][K_MAT_I][z];
 		    qerr2 += Perr[z]*k_qual2[i][K_MIS_I][z];
 		}
-		qerr = k_qual[i][K_MAT_I] + k_qual[i][K_MIS_I];
 		nerr = k_count[i][K_MIS_I];
+		ncnt = k_count[i][K_MIS_I] + k_count[i][K_MAT_I];
+		break;
 	    }
 
 	    if (!nerr) continue;
 
-	    double err = (double)nerr / ntot;
+	    double err = (double)nerr / ncnt;
 	    int qreal = nerr ? -10*log10(err)+.5 : 99;
-	    int qcall = (int)(-4.343*log(qerr / ntot)+.5);
-	    int qcall2 = (int)(-4.343*log(qerr2 / ntot)+.5);
-	    char *s[] = {"MATCH", "UNDER", "OVER", "MINS"};
+	    int qcall = (int)(-4.343*log(qerr / ncnt)+.5);
+	    int qcall2 = (int)(-4.343*log(qerr2 / ncnt)+.5);
+	    char *s[] = {"MATCH", "UNDER", "OVER", "MAT_M", "MAT_I"};
 
 	    printf("%05o ", i);
 	    for (j = WIN_LEN-1; j >= 0; j--)
 		putchar("ACGTNNNN"[(i>>(j*3))&7]);
-	    printf("\t%s\t%12d\t%12d\t%d\t%d\t%d\t%d\n",
-		   s[k], nerr, ntot, qreal, qcall,qcall2,
-		   (int)qerr3/qerr3_c);
+	    printf("\t%s\t%12d\t%12d\t%d\t%d\t%d\n",
+		   s[k], nerr, ncnt, qreal, qcall,qcall2);
 	    
 	}
     }
