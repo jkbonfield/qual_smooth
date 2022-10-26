@@ -134,6 +134,8 @@ This gives us easier matching of nth base of insertion vs nth pos in ref.
 #include <htslib/thread_pool.h>
 #include <htslib/regidx.h>
 
+#include "str_finder.h"
+
 // -- good ones
 #define K_MAT_M 0 // match in M op
 #define K_MAT_I 1 // match in I op
@@ -147,14 +149,16 @@ This gives us easier matching of nth base of insertion vs nth pos in ref.
 #define K_UNDER 6 // undercall; rogue D op
 #define K_NCAT  (K_UNDER+1)
 #define K_CAT "MIDxiou"
-uint32_t (*k_count)[K_NCAT] = NULL;
-double   (*k_qual) [K_NCAT] = NULL;
-double   (*k_qual2)[K_NCAT][99] = NULL;
+// [4<<WIN_LEN][TYPE][IS_STR]
+uint32_t (*k_count)[K_NCAT][2] = NULL;
+double   (*k_qual) [K_NCAT][2] = NULL;
+double   (*k_qual2)[K_NCAT][2][99] = NULL;
 
-#define ST_HALO 50 // distance from indel
+#define ST_HALO 10 // distance from indel/str
 #define ST_NEAR_INS 1
 #define ST_NEAR_DEL 2
 #define ST_NEAR_STR 4
+#define ST_IN_STR   8
 
 
 
@@ -168,6 +172,7 @@ int      (*kmer_qual2)[3][99] = NULL;     // sum of estimated errors from qual
 #define KMER_INIT (05555555555 & WIN_MASK);
 
 #define MIN(a,b) ((a)<(b)?(a):(b))
+#define MAX(a,b) ((a)>(b)?(a):(b))
 
 
 double Perr[256];
@@ -218,6 +223,34 @@ hts_pos_t *build_ref_map(uint8_t *ref, hts_pos_t *len_p, uint8_t *stat,
     if (!map)
 	return NULL;
 
+    fprintf(stderr, "Finding STRs\n");
+    // Find and mark STRs
+    rep_ele *reps, *elt, *tmp;
+    reps = find_STR((char *)ref, len, 0);
+    fprintf(stderr, "Marking STRs\n");
+    DL_FOREACH_SAFE(reps, elt, tmp) {
+//        printf("%2d .. %2d %2d %.*s\n", elt->start, elt->end, elt->rep_len,
+//               elt->end - elt->start+1, &ref[elt->start]);
+
+	// Filter trivial ones
+	if (elt->end - elt->start + 1 <= 3 ||
+	    (elt->end - elt->start + 1) / elt->rep_len <= 2)
+	    continue;
+
+	// Initialising from zero, so these could be memsets
+
+//	for (int i = MAX(elt->start-elt->rep_len,0); i <= elt->start; i++)
+//	    stat[i] |= ST_NEAR_STR;
+	for (int i = elt->start; i <= elt->end && i < len; i++)
+	    stat[i] |= ST_IN_STR;
+//	for (int i = elt->end; i < MIN(elt->end+elt->start, len); i++)
+//	    stat[i] |= ST_NEAR_STR;
+
+	DL_DELETE(reps, elt);
+	free(elt);
+    }
+    fprintf(stderr, "Accumulating kmers\n");
+
     // As we have deletions shown, can guarantee ref_len <= cons_len.
     hts_pos_t i, r;
     if (mark_ins == 0) {
@@ -227,35 +260,41 @@ hts_pos_t *build_ref_map(uint8_t *ref, hts_pos_t *len_p, uint8_t *stat,
 	    else if (islower(ref[i]))
 		ref[i] = toupper(ref[i]) | 0x80; // internal marker for ins
 
-	    if (ref[i] == '*') {
-		for (int z = -ST_HALO; z <= ST_HALO; z++)
-		    if (i+z >= 0 && i+z < len)
-			stat[i+z] |= ST_NEAR_DEL;
-	    }
-	    if (ref[i] & 0x80) {
-		for (int z = -ST_HALO; z <= ST_HALO; z++)
-		    if (i+z >= 0 && i+z < len)
-			stat[i+z] |= ST_NEAR_INS;
-	    }
+//	    if (ref[i] == '*') {
+//		for (int z = -ST_HALO; z <= ST_HALO; z++)
+//		    if (i+z >= 0 && i+z < len)
+//			stat[i+z] |= ST_NEAR_DEL;
+//	    }
+//	    if (ref[i] & 0x80) {
+//		for (int z = -ST_HALO; z <= ST_HALO; z++)
+//		    if (i+z >= 0 && i+z < len)
+//			stat[i+z] |= ST_NEAR_INS;
+//	    }
 	}
     } else {
 	// TODO use qual and have a filter for ref bases to skip.
+
+	// Collapse insertion '_' markers.  This therefore shrinks the
+	// ref[] and stat[] arrays and updates them with their new lengths.
+	// Insertions are marked with top-bit set, as above.
 	int k;
 	for (i = k = r = 0; i < len; i++) {
 	    if (ref[i] == '_') {
+		stat[k] = stat[i];
 		ref[k++] = ref[++i] | 0x80; // mark insertion
-		for (int z = -ST_HALO; z <= ST_HALO; z++)
-		    if (k+z >= 0 && k+z < len)
-			stat[k+z] |= ST_NEAR_INS;
+//		for (int z = -ST_HALO; z <= ST_HALO; z++)
+//		    if (k+z >= 0 && k+z < len)
+//			stat[k+z] |= ST_NEAR_INS;
 	    } else {
+		stat[k] = stat[i];
 		map[r++] = k;
 		ref[k++] = ref[i];
 
-		if (islower(ref[i])) {
-		for (int z = -ST_HALO; z <= ST_HALO; z++)
-		    if (k+z >= 0 && k+z < len)
-			stat[k+z] |= ST_NEAR_DEL;
-		}
+//		if (islower(ref[i])) {
+//		    for (int z = -ST_HALO; z <= ST_HALO; z++)
+//			if (k+z >= 0 && k+z < len)
+//			    stat[k+z] |= ST_NEAR_DEL;
+//		}
 	    }
 	}
 	*len_p = k;
@@ -430,15 +469,23 @@ static inline void incr_kmer(regitr_t *bed_itr, hts_pos_t rpos,
     }
 }
 
+int k_skip = 0;
+int k_hist_kmer[WIN_LEN/2];
+int k_hist_type[WIN_LEN/2];
+int k_hist_str[WIN_LEN/2];
+double k_hist_qual[WIN_LEN/2];
+int k_hist_qual2[WIN_LEN/2];
+int64_t k_num = 0;
+
+static hts_pos_t *global_map = NULL;
 static inline void incr_kmer2(regitr_t *bed_itr, uint8_t stat, hts_pos_t rpos,
 			      uint32_t kmer, int type, int ok, int qual) {
     int ok2 = type<K_WRONG;
     assert(ok == ok2);
-    
-//    if (stat) // not near an indel
-//	return;
 
-//    printf("Incr %05o %c %d %d %d\n", kmer, K_CAT[type], ok, qual, type);
+    int is_str = stat & ST_IN_STR ? 1 : 0;
+
+//    printf("stat %2x Incr %05o %c %d %d %d\n", stat, kmer, K_CAT[type], ok, qual, type);
     if (in_bed(bed_itr, rpos)) {
 	// Keep list of last WIN_LEN/2 kmers added (if OK), so we can
 	// undo them if we add a not-OK one.  Similarly track the numeber
@@ -449,9 +496,9 @@ static inline void incr_kmer2(regitr_t *bed_itr, uint8_t stat, hts_pos_t rpos,
 	    skipped=1;
 //	    printf("Skip %05o\n", kmer);
 	} else {
-	    k_count[kmer][type]++;
-	    k_qual[kmer][type] += Perr[qual];
-	    k_qual2[kmer][type][qual]++;
+	    k_count[kmer][type][is_str]++;
+	    k_qual[kmer][type][is_str] += Perr[qual];
+	    k_qual2[kmer][type][is_str][qual]++;
 //	    if (kmer == 031022 && type == K_OVER)
 //		printf("31022: overcall with qual %d\n", qual);
 	    skipped=0;
@@ -460,41 +507,37 @@ static inline void incr_kmer2(regitr_t *bed_itr, uint8_t stat, hts_pos_t rpos,
 	// Revert to ignore
 	if (!ok) {
 	    for (int i = 0; i < WIN_LEN/2; i++) {
-		int h_ok = kmer_hist_type[i] < K_WRONG;
+		int h_ok = k_hist_type[i] < K_WRONG;
 //		printf("%s %05o to ignore, count %d type %d\n",
 //		       h_ok ? "Reset" : "RDone",
-//		       kmer_hist_kmer[i],
-//		       k_count[kmer_hist_kmer[i]][kmer_hist_type[i]],
-//		       kmer_hist_type[i]);
+//		       k_kmer[i],
+//		       k_count[k_hist_kmer[i]][k_hist_type[i]],
+//		       k_hist_type[i]);
 		if (h_ok) {
-		    k_count[kmer_hist_kmer[i]][kmer_hist_type[i]]--;
-		    k_qual [kmer_hist_kmer[i]][kmer_hist_type[i]]
-			-= kmer_hist_qual[i];
-		    k_qual2[kmer_hist_kmer[i]][kmer_hist_type[i]][kmer_hist_qual2[i]]--;
-		    if (k_count[kmer_hist_kmer[i]][kmer_hist_type[i]] > 2000000000) {
-			fflush(stdout);
-			fflush(stderr);
-			exit(1);
-		    }
+		    k_count[k_hist_kmer[i]][k_hist_type[i]][k_hist_str[i]]--;
+		    k_qual [k_hist_kmer[i]][k_hist_type[i]][k_hist_str[i]]
+			-= k_hist_qual[i];
+		    k_qual2[k_hist_kmer[i]][k_hist_type[i]][k_hist_str[i]][k_hist_qual2[i]]--;
 		}
-		kmer_hist_type[i] = 99; // prevent double decr is more err
+		k_hist_type[i] = 99; // prevent double decr is more err
 	    }
 	    kmer_skip = WIN_LEN/2;
 	}
 
 	// cache
 	int idx = kmer_num % (WIN_LEN/2); // could also round and AND
-	kmer_hist_kmer[idx] = kmer;
-	kmer_hist_type[idx] = skipped ? 99 : type;
-	//printf("type[%05o,%d] = %d / %d\n", kmer, idx, type, kmer_hist_type[idx]);
-	kmer_hist_qual[idx] = Perr[qual];
-	kmer_hist_qual2[idx] = qual;
+	k_hist_kmer[idx] = kmer;
+	k_hist_type[idx] = skipped ? 99 : type;
+	k_hist_str[idx] = is_str;
+	//printf("type[%05o,%d] = %d / %d\n", kmer, idx, type, k_hist_type[idx]);
+	k_hist_qual[idx] = Perr[qual];
+	k_hist_qual2[idx] = qual;
 	kmer_num++;
     } else {
-	// TODO: set kmer_hist_type to 99.  Optimise this as only
+	// TODO: set k_hist_type to 99.  Optimise this as only
 	// need it on in-bed to out-bed transitions
 	for (int i = 0; i < WIN_LEN/2; i++)
-	    kmer_hist_type[i] = 99;
+	    k_hist_type[i] = 99;
     }
 }
 
@@ -793,113 +836,128 @@ void dump_kmers2(void) {
 	if (j < WIN_LEN)
 	    continue;
 
-	// K_MAT_[MID] are all matches, but for M, I and D cigar ops.
-	// (Eg cons is I and seq is I and sequences match).
-	// So this is the total of "good".
-	//
-	// K_MIS_[MI] are matching cigar ops (eg both cons/seq is I) but
-	// a substitution error.
-	//
-	// So K_MIS_M/K_MAT_M vs K_MIS_I/K_MAT_I can give us an indication
-	// of potential alignment reference bias.  Both sequence data and
-	// sample are in agreement, but the reference is the thing changing.
+	for (int is_str = 0; is_str <= 2; is_str++) {
+	    // 2 being is_str==0 + is_str==1
 
-	// K_OVER and K_UNDER represent cigar op issues where cons/seq
-	// differ on the number of base calls
-	int ntrue = k_count[i][K_MAT_M] 
-	          + k_count[i][K_MAT_I]
-	          + k_count[i][K_MAT_D];
-	int nsubst= k_count[i][K_MIS_M]
-	          + k_count[i][K_MIS_I];
-	int nunder= k_count[i][K_UNDER];
-	int nover = k_count[i][K_OVER];
+	    int STR = is_str & 1; // 0 or 1
 
-	int ntot  = ntrue + nsubst + nunder + nover;
+	    // K_MAT_[MID] are all matches, but for M, I and D cigar ops.
+	    // (Eg cons is I and seq is I and sequences match).
+	    // So this is the total of "good".
+	    //
+	    // K_MIS_[MI] are matching cigar ops (eg both cons/seq is I) but
+	    // a substitution error.
+	    //
+	    // So K_MIS_M/K_MAT_M vs K_MIS_I/K_MAT_I can give us an indication
+	    // of potential alignment reference bias.  Both sequence data and
+	    // sample are in agreement, but the reference is the thing changing.
 
-	if (!ntot)
-	    continue;
+	    // K_OVER and K_UNDER represent cigar op issues where cons/seq
+	    // differ on the number of base calls
+	    int ntrue = k_count[i][K_MAT_M][STR] 
+		+ k_count[i][K_MAT_I][STR]
+		+ k_count[i][K_MAT_D][STR];
+	    int nsubst= k_count[i][K_MIS_M][STR]
+		+ k_count[i][K_MIS_I][STR];
+	    int nunder= k_count[i][K_UNDER][STR];
+	    int nover = k_count[i][K_OVER ][STR];
 
-	for (k = 0; k < 5; k++) {
-	    int nerr, ncnt;
-	    double qerr;
-	    qerr = k_qual[i][K_MAT_M]
-		+ k_qual[i][K_MAT_I]
-		+ k_qual[i][K_MAT_D]
-		+ k_qual[i][K_MIS_M]
-		+ k_qual[i][K_MIS_I];
-	    double qerr2 = 0;
-	    for (int z = 99; z >= 0; z--) {
-		// amortised phred error score
-		qerr2 += Perr[z]*k_qual2[i][K_MAT_M][z];
-		qerr2 += Perr[z]*k_qual2[i][K_MAT_I][z];
-		qerr2 += Perr[z]*k_qual2[i][K_MAT_D][z];
-		qerr2 += Perr[z]*k_qual2[i][K_MAT_M][z];
-		qerr2 += Perr[z]*k_qual2[i][K_MIS_M][z];
-		qerr2 += Perr[z]*k_qual2[i][K_MIS_I][z];
-	    }
-	    ncnt = ntot;
-	    switch (k) {
-	    case 0:
-		nerr = nsubst;
-		break;
-	    case 1:
-		nerr = nunder;
-		qerr += k_qual[i][K_UNDER];
-		for (int z = 99; z >= 0; z--)
-		    qerr2 += Perr[z]*k_qual2[i][K_UNDER][z];
-		break;
-	    case 2:
-		nerr = nover;
-		qerr += k_qual[i][K_OVER];
-		for (int z = 99; z >= 0; z--)
-		    qerr2 += Perr[z]*k_qual2[i][K_OVER][z];
-		break;
+	    int ntot  = ntrue + nsubst + nunder + nover;
 
+	    if (!ntot)
+		continue;
 
-	    // Looking for reference bias.
-	    // Compare substitution errors in places where sample and cons
-	    // are in sync, but both cigar-Ms vs both cigar-Is.
-	    // A cigar-I match here is where the consensus is insertion
-	    // as well as sample (FIXME: limit to homozygous only?), but
-	    // the reference doesn't have this base.
-	    // If there is a difference, it's due to alignment artifacts
-	    // instead.
-	    case 3: // match in M cigar ops only
-		qerr = qerr2 = 0;
-		qerr = k_qual[i][K_MAT_M] + k_qual[i][K_MIS_M];
+	    for (k = 0; k < 5; k++) {
+		int nerr, ncnt;
+		double qerr;
+		qerr = k_qual[i][K_MAT_M][STR]
+		    + k_qual[i][K_MAT_I][STR]
+		    + k_qual[i][K_MAT_D][STR]
+		    + k_qual[i][K_MIS_M][STR]
+		    + k_qual[i][K_MIS_I][STR];
+		double qerr2 = 0;
 		for (int z = 99; z >= 0; z--) {
-		    qerr2 += Perr[z]*k_qual2[i][K_MAT_M][z];
-		    qerr2 += Perr[z]*k_qual2[i][K_MIS_M][z];
+		    // amortised phred error score
+		    qerr2 += Perr[z]*k_qual2[i][K_MAT_M][STR][z];
+		    qerr2 += Perr[z]*k_qual2[i][K_MAT_I][STR][z];
+		    qerr2 += Perr[z]*k_qual2[i][K_MAT_D][STR][z];
+		    qerr2 += Perr[z]*k_qual2[i][K_MAT_M][STR][z];
+		    qerr2 += Perr[z]*k_qual2[i][K_MIS_M][STR][z];
+		    qerr2 += Perr[z]*k_qual2[i][K_MIS_I][STR][z];
 		}
-		nerr = k_count[i][K_MIS_M];
-		ncnt = k_count[i][K_MIS_M] + k_count[i][K_MAT_M];
-		break;
-	    case 4: // match in I cigar ops only
-		qerr = qerr2 = 0;
-		qerr = k_qual[i][K_MAT_I] + k_qual[i][K_MIS_I];
-		for (int z = 99; z >= 0; z--) {
-		    qerr2 += Perr[z]*k_qual2[i][K_MAT_I][z];
-		    qerr2 += Perr[z]*k_qual2[i][K_MIS_I][z];
+		ncnt = ntot;
+		switch (k) {
+		case 0:
+		    nerr = nsubst;
+		    break;
+		case 1:
+		    nerr = nunder;
+		    qerr += k_qual[i][K_UNDER][STR];
+		    for (int z = 99; z >= 0; z--)
+			qerr2 += Perr[z]*k_qual2[i][K_UNDER][STR][z];
+		    break;
+		case 2:
+		    nerr = nover;
+		    qerr += k_qual[i][K_OVER][STR];
+		    for (int z = 99; z >= 0; z--)
+			qerr2 += Perr[z]*k_qual2[i][K_OVER][STR][z];
+		    break;
+
+
+		    // Looking for reference bias.
+		    // Compare substitution errors in places where sample and cons
+		    // are in sync, but both cigar-Ms vs both cigar-Is.
+		    // A cigar-I match here is where the consensus is insertion
+		    // as well as sample (FIXME: limit to homozygous only?), but
+		    // the reference doesn't have this base.
+		    // If there is a difference, it's due to alignment artifacts
+		    // instead.
+		case 3: // match in M cigar ops only
+		    qerr = qerr2 = 0;
+		    qerr = k_qual[i][K_MAT_M][STR] + k_qual[i][K_MIS_M][STR];
+		    for (int z = 99; z >= 0; z--) {
+			qerr2 += Perr[z]*k_qual2[i][K_MAT_M][STR][z];
+			qerr2 += Perr[z]*k_qual2[i][K_MIS_M][STR][z];
+		    }
+		    nerr = k_count[i][K_MIS_M][STR];
+		    ncnt = k_count[i][K_MIS_M][STR] + k_count[i][K_MAT_M][STR];
+		    break;
+		case 4: // match in I cigar ops only
+		    qerr = qerr2 = 0;
+		    qerr = k_qual[i][K_MAT_I][STR] + k_qual[i][K_MIS_I][STR];
+		    for (int z = 99; z >= 0; z--) {
+			qerr2 += Perr[z]*k_qual2[i][K_MAT_I][STR][z];
+			qerr2 += Perr[z]*k_qual2[i][K_MIS_I][STR][z];
+		    }
+		    nerr = k_count[i][K_MIS_I][STR];
+		    ncnt = k_count[i][K_MIS_I][STR] + k_count[i][K_MAT_I][STR];
+		    break;
 		}
-		nerr = k_count[i][K_MIS_I];
-		ncnt = k_count[i][K_MIS_I] + k_count[i][K_MAT_I];
-		break;
-	    }
 
-	    if (!nerr) continue;
+		if (!nerr) continue;
 
-	    double err = (double)nerr / ncnt;
-	    int qreal = nerr ? -10*log10(err)+.5 : 99;
-	    int qcall = (int)(-4.343*log(qerr / ncnt)+.5);
-	    int qcall2 = (int)(-4.343*log(qerr2 / ncnt)+.5);
-	    char *s[] = {"MATCH", "UNDER", "OVER", "MAT_M", "MAT_I"};
+		double err = (double)nerr / ncnt;
+		int qreal = nerr ? -10*log10(err)+.5 : 99;
+		int qcall = (int)(-4.343*log(qerr / ncnt)+.5);
+		int qcall2 = (int)(-4.343*log(qerr2 / ncnt)+.5);
+		char *s[] = {"MATCH", "UNDER", "OVER", "MAT_M", "MAT_I"};
 
-	    printf("%05o ", i);
-	    for (j = WIN_LEN-1; j >= 0; j--)
-		putchar("ACGTNNNN"[(i>>(j*3))&7]);
-	    printf("\t%s\t%12d\t%12d\t%d\t%d\t%d\n",
-		   s[k], nerr, ncnt, qreal, qcall,qcall2);
+		printf("%05o ", i);
+		for (j = WIN_LEN-1; j >= 0; j--)
+		    putchar("ACGTNNNN"[(i>>(j*3))&7]);
+		printf("\t%s%d\t%12d\t%12d\t%d\t%d\t%d\n",
+		       s[k], is_str, nerr, ncnt, qreal, qcall,qcall2);
 	    
+	    }
+
+	    // is_str==2 is sum of 0 and 1, so add 1 into 0 and use str&1
+	    if (is_str == 1) {
+		for (k = 0; k < 7; k++) {
+		    k_count[i][k][0] += k_count[i][k][1];
+		    for (int q = 0; q < 99; q++)
+			k_qual2[i][k][0][q] += k_qual2[i][k][1][q];
+		}
+	    }
 	}
     }
 }
@@ -995,6 +1053,7 @@ int main(int argc, char **argv) {
 	if (b->core.tid < 0)
 	    continue;
 	if (b->core.tid != last_tid) {
+	    fprintf(stderr, "Fetching ref sequence\n");
 	    if (ref)
 		free(ref);
 	    ref = (uint8_t *)
@@ -1009,6 +1068,7 @@ int main(int argc, char **argv) {
 		free(map);
 	    if (!(map = build_ref_map(ref, &ref_len, stat, mark_ins)))
 		goto err;
+	    global_map = map;
 	    last_tid = b->core.tid;
 	}
 	//puts(bam_get_qname(b));

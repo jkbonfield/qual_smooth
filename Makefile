@@ -16,8 +16,9 @@ OBJS = smooth.o entropy.o
 qual_smooth: $(OBJS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(OBJS) -o $@ $(LDFLAGS)
 
-qual_train: train.o
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@ $(LDFLAGS)
+QOBJS=train.o str_finder.o
+qual_train: $(QOBJS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(QOBJS) -o $@ $(LDFLAGS)
 
 clean:
 	rm qual_smooth qual_train *.o
