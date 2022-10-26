@@ -796,77 +796,110 @@ void dump_kmers2(void) {
 	// K_MAT_[MID] are all matches, but for M, I and D cigar ops.
 	// (Eg cons is I and seq is I and sequences match).
 	// So this is the total of "good".
-
+	//
 	// K_MIS_[MI] are matching cigar ops (eg both cons/seq is I) but
 	// a substitution error.
+	//
+	// So K_MIS_M/K_MAT_M vs K_MIS_I/K_MAT_I can give us an indication
+	// of potential alignment reference bias.  Both sequence data and
+	// sample are in agreement, but the reference is the thing changing.
 
 	// K_OVER and K_UNDER represent cigar op issues where cons/seq
 	// differ on the number of base calls
 	int ntrue = k_count[i][K_MAT_M] 
 	          + k_count[i][K_MAT_I]
 	          + k_count[i][K_MAT_D];
-	int nsub  = k_count[i][K_MIS_M]
+	int nsubst= k_count[i][K_MIS_M]
 	          + k_count[i][K_MIS_I];
 	int nunder= k_count[i][K_UNDER];
 	int nover = k_count[i][K_OVER];
 
-	int ntot  = ntrue + nsub + nunder + nover;
+	int ntot  = ntrue + nsubst + nunder + nover;
 
 	if (!ntot)
 	    continue;
 
 	for (k = 0; k < 3; k++) {
-	    int nerr, ncnt = nsub + ntrue, ncnt2;
+	    int nerr;
 	    double qerr;
 	    qerr = k_qual[i][K_MAT_M]
 		+ k_qual[i][K_MAT_I]
 		+ k_qual[i][K_MAT_D]
 		+ k_qual[i][K_MIS_M]
 		+ k_qual[i][K_MIS_I];
-	    double qerr2 = 0;
+	    double qerr2 = 0, qerr3 = 0;
+	    int qerr3_c = 0;
 	    for (int z = 99; z >= 0; z--) {
+		// amortised phred error score
 		qerr2 += Perr[z]*k_qual2[i][K_MAT_M][z];
 		qerr2 += Perr[z]*k_qual2[i][K_MAT_I][z];
 		qerr2 += Perr[z]*k_qual2[i][K_MAT_D][z];
 		qerr2 += Perr[z]*k_qual2[i][K_MAT_M][z];
 		qerr2 += Perr[z]*k_qual2[i][K_MIS_M][z];
 		qerr2 += Perr[z]*k_qual2[i][K_MIS_I][z];
+
+		// Somewhat meaningless average phred qual.
+		// Not helpful, but average qual is often quoted.
+		// I should probably discard this again.
+		qerr3 += z*k_qual2[i][K_MAT_M][z]; qerr3_c += k_qual2[i][K_MAT_M][z];
+		qerr3 += z*k_qual2[i][K_MAT_I][z]; qerr3_c += k_qual2[i][K_MAT_I][z];
+		qerr3 += z*k_qual2[i][K_MAT_D][z]; qerr3_c += k_qual2[i][K_MAT_D][z];
+		qerr3 += z*k_qual2[i][K_MAT_M][z]; qerr3_c += k_qual2[i][K_MAT_M][z];
+		qerr3 += z*k_qual2[i][K_MIS_M][z]; qerr3_c += k_qual2[i][K_MIS_M][z];
+		qerr3 += z*k_qual2[i][K_MIS_I][z]; qerr3_c += k_qual2[i][K_MIS_I][z];
 	    }
 	    switch (k) {
 	    case 0:
-		nerr = nsub;
-		ncnt2 = ncnt;
+		nerr = nsubst;
 		break;
 	    case 1:
 		nerr = nunder;
-		ncnt += (ncnt2 = nunder);
 		qerr += k_qual[i][K_UNDER];
-		for (int z = 99; z >= 0; z--)
+		for (int z = 99; z >= 0; z--) {
 		    qerr2 += Perr[z]*k_qual2[i][K_UNDER][z];
+		    qerr3 += z*k_qual2[i][K_UNDER][z];
+		    qerr3_c += k_qual2[i][K_UNDER][z];
+		}
 		break;
 	    case 2:
 		nerr = nover;
-		ncnt += (ncnt2 = nover);
 		qerr += k_qual[i][K_OVER];
-		for (int z = 99; z >= 0; z--)
+		for (int z = 99; z >= 0; z--) {
 		    qerr2 += Perr[z]*k_qual2[i][K_OVER][z];
+		    qerr3 += z*k_qual2[i][K_OVER][z];
+		    qerr3_c += k_qual2[i][K_OVER][z];
+		}
 		break;
+
+	    case 3:
+		// Unused (see loop end), but shows seq vs cons match
+		// where both are in CIGAR I op.  The sample size will be
+		// small, but this can potentially show reference bias as
+		// the data matches the truth set, but we may have many
+		// misaligned reads due to them ended near the insertion.
+		qerr = qerr2 = 0;
+		for (int z = 99; z >= 0; z--) {
+		    qerr2 += Perr[z]*k_qual2[i][K_MAT_I][z];
+		    qerr2 += Perr[z]*k_qual2[i][K_MIS_I][z];
+		}
+		qerr = k_qual[i][K_MAT_I] + k_qual[i][K_MIS_I];
+		nerr = k_count[i][K_MIS_I];
 	    }
 
-	    if (!ncnt2)
-		continue;
+	    if (!nerr) continue;
 
-	    double err = (double)nerr / ncnt;
-	    int qreal = err ? -10*log10(err)+.5 : 99;
-	    int qcall = (int)(-4.343*log(qerr / ncnt)+.5);
-	    int qcall2 = (int)(-4.343*log(qerr2 / ncnt)+.5);
-	    char *s[] = {"MATCH", "UNDER", "OVER"};
+	    double err = (double)nerr / ntot;
+	    int qreal = nerr ? -10*log10(err)+.5 : 99;
+	    int qcall = (int)(-4.343*log(qerr / ntot)+.5);
+	    int qcall2 = (int)(-4.343*log(qerr2 / ntot)+.5);
+	    char *s[] = {"MATCH", "UNDER", "OVER", "MINS"};
 
 	    printf("%05o ", i);
 	    for (j = WIN_LEN-1; j >= 0; j--)
 		putchar("ACGTNNNN"[(i>>(j*3))&7]);
-	    printf("\t%s\t%12d\t%12d\t%d\t%d\t%d\n",
-		   s[k], nerr, ncnt, qreal, qcall,qcall2);
+	    printf("\t%s\t%12d\t%12d\t%d\t%d\t%d\t%d\n",
+		   s[k], nerr, ntot, qreal, qcall,qcall2,
+		   (int)qerr3/qerr3_c);
 	    
 	}
     }
