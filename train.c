@@ -105,21 +105,14 @@ This gives us easier matching of nth base of insertion vs nth pos in ref.
  * Start with:
  * samtools faidx $HREF38 chr1 \|
  * bcftools consensus -I --mark-ins lc --mark-del "*" truth.vcf > chr1.fa
- * ./qual_train -b truth.bed -f $HREF38 -r chr1 truth.bam
+ * ./qual_train -b truth.bed -f chr1.fa -r chr1 truth.bam
  *
  * Then "*" is del, [acgt] is ins, and RYMSW etc het.
  * => can map ref coords to sample coords.
  *
- * TODO:
- * - Add bed filter regions too.
- *
- * - Auto-build a hom/het consensus instead of relying on a truth set.
- *   Like Crumble, we could ignore unknown data and concentrate on clear
- *   hom/het/indel positions.
- *
- * - How to handle heterozygous insertions.  Bcftools consensus has no
- *   ambiguity code to represent this?  Samtools consensus uses lowercase,
- *   but then we need an alternative mechanism for cons->ref coord mapping.
+ * Or start with (note -m):
+ * samtools consensus -a --show-del yes --mark-ins -r $REG in.bam > in.fa
+ * ./qual_train -b truth.bed -m -f in.fa -r $REG in.bam
  */
 
 #include <stdio.h>
@@ -415,61 +408,6 @@ int in_bed(regitr_t *bed_itr, hts_pos_t pos) {
     return pos >= bed_itr->beg && pos <= bed_itr->end ? 1 : 0;
 }
 
-int kmer_skip = 0;
-int kmer_hist_kmer[WIN_LEN/2];
-int kmer_hist_type[WIN_LEN/2];
-int kmer_hist_ok[WIN_LEN/2];
-double kmer_hist_qual[WIN_LEN/2];
-int kmer_hist_qual2[WIN_LEN/2];
-int64_t kmer_num = 0;
-
-static inline void incr_kmer(regitr_t *bed_itr, hts_pos_t rpos,
-			     uint32_t kmer, int type, int ok, int qual) {
-//    printf("Incr %05o %c %d %d\n", kmer, "MID"[type], ok, qual);
-
-    if (in_bed(bed_itr, rpos)) {
-	// Keep list of last WIN_LEN/2 kmers added (if OK), so we can
-	// undo them if we add a not-OK one.  Similarly track the numeber
-	// of subsequent kmers to skip (if OK).
-	if (kmer_skip && ok) {
-	    kmer_skip--;
-	    //kmer_hist_ok[(kmer_num++) % (WIN_LEN/2)] = 0;
-	    //printf("Skip %05o\n", kmer);
-	} else {
-	    kmer_count[kmer][type][ok]++;
-	    kmer_qual[kmer][type] += Perr[qual];
-	    kmer_qual2[kmer][type][qual]++;
-	}
-
-	// Revert to ignore
-	if (!ok) {
-	    for (int i = 0; i < WIN_LEN/2; i++) {
-		int h_ok = kmer_hist_ok[i];
-		if (!h_ok) {
-		    //printf("Kmer %05o wasn't OK anyway\n", kmer_hist_kmer[i]);
-		    continue;
-		}		    
-		kmer_count[kmer_hist_kmer[i]][kmer_hist_type[i]][h_ok]--;
-		kmer_qual [kmer_hist_kmer[i]][kmer_hist_type[i]]
-		    -= kmer_hist_qual[i];
-		kmer_qual2[kmer_hist_kmer[i]][kmer_hist_type[i]][kmer_hist_qual2[i]]--;
-		kmer_hist_ok[i] = 0; // prevent another decr on next-err
-		//printf("Reset %05o to ignore\n", kmer_hist_kmer[i]);
-	    }
-	    kmer_skip = WIN_LEN/2;
-	}
-
-	// cache
-	int idx = kmer_num % (WIN_LEN/2); // could also round and AND
-	kmer_hist_kmer[idx] = kmer;
-	kmer_hist_type[idx] = type;
-	kmer_hist_ok  [idx] = ok;
-	kmer_hist_qual[idx] = Perr[qual];
-	kmer_hist_qual2[idx] = qual;
-	kmer_num++;
-    }
-}
-
 int k_skip = 0;
 int k_hist_kmer[WIN_LEN/2];
 int k_hist_type[WIN_LEN/2];
@@ -492,8 +430,8 @@ static inline void incr_kmer2(regitr_t *bed_itr, uint8_t stat, hts_pos_t rpos,
 	// undo them if we add a not-OK one.  Similarly track the numeber
 	// of subsequent kmers to skip (if OK).
 	int skipped;
-	if (kmer_skip && ok) {
-	    kmer_skip--;
+	if (k_skip && ok) {
+	    k_skip--;
 	    skipped=1;
 //	    printf("Skip %05o\n", kmer);
 	} else {
@@ -522,18 +460,18 @@ static inline void incr_kmer2(regitr_t *bed_itr, uint8_t stat, hts_pos_t rpos,
 		}
 		k_hist_type[i] = 99; // prevent double decr is more err
 	    }
-	    kmer_skip = WIN_LEN/2;
+	    k_skip = WIN_LEN/2;
 	}
 
 	// cache
-	int idx = kmer_num % (WIN_LEN/2); // could also round and AND
+	int idx = k_num % (WIN_LEN/2); // could also round and AND
 	k_hist_kmer[idx] = kmer;
 	k_hist_type[idx] = skipped ? 99 : type;
 	k_hist_str[idx] = is_str;
 	//printf("type[%05o,%d] = %d / %d\n", kmer, idx, type, k_hist_type[idx]);
 	k_hist_qual[idx] = Perr[qual];
 	k_hist_qual2[idx] = qual;
-	kmer_num++;
+	k_num++;
     } else {
 	// TODO: set k_hist_type to 99.  Optimise this as only
 	// need it on in-bed to out-bed transitions
@@ -634,7 +572,6 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref,
 		    if (V) printf("dm %ld\t%c %c *\n", rpos, rbase, qbase);
 #ifndef MATCH_ONLY
 		    // TYPE: undercall (cons has an insertion, we did not)
-		    //incr_kmer(bed_itr, rpos, kmer, KDEL, 0, qqual);
 		    incr_kmer2(bed_itr, rst, rpos, kmer, K_UNDER, 0, qqual);
 #endif
 		} else {
@@ -642,14 +579,12 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref,
 			if (V>1)
 			    printf("M  %ld\t%c %c\n", rpos, rbase, qbase);
 			// TYPE: match-match
-			//incr_kmer(bed_itr, rpos, kmer, KMAT, 1, qqual);
 			incr_kmer2(bed_itr, rst, rpos, kmer, K_MAT_M, 1, qqual);
 		    } else if (rbase == '*') {
 			if (V)
 			    printf("im %ld\t%c %c *\n", rpos, rbase, qbase);
 #ifndef MATCH_ONLY
 			// TYPE: overcall
-			//incr_kmer(bed_itr, rpos, kmer, KINS, 0, qqual);
 			incr_kmer2(bed_itr, rst, rpos, kmer, K_OVER, 0, qqual);
 #endif
 		    } else if (rbase != 'N') {
@@ -660,7 +595,6 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref,
 			}
 
 			// TYPE: substitution
-			//incr_kmer(bed_itr, rpos, kmer, KMAT, 0, qqual);
 			incr_kmer2(bed_itr, rst, rpos, kmer, K_MIS_M, 0, qqual);
 		    }
 		}
@@ -709,7 +643,6 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref,
 			    printf("mD %ld\t. %c *\n", rpos,  qbase);
 #ifndef MATCH_ONLY
 			// TYPE: undercall (cons had insertion, we did not)
-			//incr_kmer(bed_itr, rpos, kmer, KDEL, 0, qqual);
 			incr_kmer2(bed_itr, rst, rpos, kmer, K_UNDER, 0, qqual);
 #endif
 		    }
@@ -725,14 +658,12 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref,
 			if (V>1) printf("mi %ld\t%c %c\n", rpos, rbase, qbase);
 #ifndef MATCH_ONLY
 			// TYPE: ins-match
-			//incr_kmer(bed_itr, rpos, kmer, KINS, 1, qqual);
 			incr_kmer2(bed_itr, rst, rpos, kmer, K_MAT_I, 1, qqual);
 #endif
 		    } else {
 			if (V>1) printf("xi %ld\t%c %c\n", rpos, rbase, qbase);
 #ifndef MATCH_ONLY
 			// TYPE: ins-substitution
-			//incr_kmer(bed_itr, rpos, kmer, KINS, 0, qqual);
 			incr_kmer2(bed_itr, rst, rpos, kmer, K_MIS_I, 0, qqual);
 #endif
 		    }
@@ -740,7 +671,6 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref,
 		    if (V) printf("I  %ld\t. %c *\n", rpos, qbase);
 #ifndef MATCH_ONLY
 		    // TYPE: overcall (no insertion in cons)
-		    //incr_kmer(bed_itr, rpos, kmer, KINS, 0, qqual);
 		    incr_kmer2(bed_itr, rst, rpos, kmer, K_OVER, 0, qqual);
 #endif
 		}
@@ -753,14 +683,12 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref,
 		    if (V>1) printf("md %ld\t%c .\n", rpos, rbase);
 #ifndef MATCH_ONLY
 		    // TYPE: del-match
-		    //incr_kmer(bed_itr, rpos, kmer, KDEL, 1, qqual);
 		    incr_kmer2(bed_itr, rst, rpos, kmer, K_MAT_D, 1, qqual);
 #endif
 		} else {
 		    if (V) printf("D  %ld\t%c . *\n", rpos, rbase);
 #ifndef MATCH_ONLY
 		    // TYPE: undercall
-		    //incr_kmer(bed_itr, rpos, kmer, KDEL, 0, qqual);
 		    incr_kmer2(bed_itr, rst, rpos, kmer, K_UNDER, 0, qqual);
 #endif
 		}
@@ -771,54 +699,6 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref,
 
 	if (cig_op == BAM_CINS)
 	    rpos++; // undo pos-- above
-    }
-}
-
-void dump_kmers(void) {
-    int i, j, k;
-    puts("=== kmers ===\n");
-    for (i = 0; i <= WIN_MASK; i++) {
-	// We record INS here vs INS cons as a valid INS,
-	// but logically this is really a "match" (or mismatch) state.
-	// Hence we use the total count across all types rather than just
-	// the specific one for this type.  Hence we could possibly
-	// combine all "pass" states into a single count during analysis
-	// and only have "fail" states for the separate types, but this is
-	// left to future exploration.
-	//
-	// Q: should we still do this however for I and D states?
-	int cnt =
-	    kmer_count[i][0][0]+kmer_count[i][0][1] +
-	    kmer_count[i][1][0]+kmer_count[i][1][1] +
-	    kmer_count[i][2][0]+kmer_count[i][2][1];
-	if (!cnt)
-	    continue;
-
-	int all_mis = 0;
-	double all_err = 0;
-	for (k = 0; k < 3; k++) {
-	    if (!(kmer_count[i][k][0]+kmer_count[i][k][1]))
-		continue;
-
-	    for (j = WIN_LEN-1; j >= 0; j--)
-		putchar("ACGTNNNN"[(i>>(j*3))&7]);
-	    double err = cnt ? (double)kmer_count[i][k][0] / cnt : 0;
-	    int qval = err ? -10*log10(err)+.5 : 99;
-	    printf("\t%c\t%12d\t%12d\t%d\t%d\n",
-		   "MID"[k], kmer_count[i][k][0], cnt, qval,
-		   (int)(-4.343*log(kmer_qual[i][k]/cnt)+.5));
-
-	    all_mis += kmer_count[i][k][0];
-	    all_err += kmer_qual[i][k];
-	}
-
-	// Combined stats
-	for (j = WIN_LEN-1; j >= 0; j--)
-	    putchar("ACGTNNNN"[(i>>(j*3))&7]);
-	double err = all_mis ? (double)all_mis / cnt : 0;
-	int qval = err ? -10*log10(err)+.5 : 99;
-	printf("\t?\t%12d\t%12d\t%d\t%d\n", all_mis, cnt, qval,
-	       (int)(-4.343*log(all_err/cnt)+.5));
     }
 }
 
@@ -1111,7 +991,6 @@ int main(int argc, char **argv) {
     if (bed_itr) regitr_destroy(bed_itr);
     if (itr) hts_itr_destroy(itr);
 
-    //dump_kmers();
     dump_kmers2();
     dump_qcal();
 
