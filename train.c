@@ -300,6 +300,14 @@ hts_pos_t *build_ref_map(uint8_t *ref, hts_pos_t *len_p, uint8_t *stat,
     return map;
 }
 
+// March pos up or down until we're outside of a known STR
+hts_pos_t trim_str(const uint8_t *flags, hts_pos_t len, hts_pos_t pos,
+		   int dir) {
+    while (pos >= 0 && pos < len && (flags[pos] & ST_IN_STR))
+	pos += dir;
+    return pos;
+}
+
 // If ref is an ambiguity code and query is compataible, then return
 // query, otherwise return N
 uint8_t ambig(uint8_t ref, uint8_t query) {
@@ -425,11 +433,12 @@ static inline void incr_kmer2(regitr_t *bed_itr, uint8_t stat, hts_pos_t rpos,
 
     // Debug
     //if(1){
-    if (!ok && !is_str) {
+    if (!ok) {
 	char *s[] = {"MAT_M", "MAT_I", "MAT_D",
 		     "MIS_M", "MIS_I", "OVER", "UNDER"};
-	fprintf(stderr, "%s %c %5s %05o %2d %ld\n",
-		ok?"OK   ":"ERROR", global_cig_op, s[type], kmer, qual, rpos);
+	fprintf(stderr, "%s %c %5s %05o %2d %ld  str %d\n",
+		ok?"OK   ":"ERROR", global_cig_op, s[type], kmer, qual, rpos,
+		is_str);
     }
 
 //    printf("stat %2x Incr %05o %c %d %d %d\n", stat, kmer, K_CAT[type], ok, qual, type);
@@ -488,10 +497,10 @@ static inline void incr_kmer2(regitr_t *bed_itr, uint8_t stat, hts_pos_t rpos,
     }
 }
 
-void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref,
-		      const uint8_t *stat, hts_pos_t *map,
+void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, const uint8_t *stat,
+		      hts_pos_t ref_len, hts_pos_t *map,
 		      bam1_t *b, regidx_t *bed, regitr_t *bed_itr,
-		      int mark_ins) { 
+		      int mark_ins, int trim_ends) {
     const int V=0; // DEBUG only
 
     if (bed_itr)
@@ -534,6 +543,19 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref,
     uint8_t *qual = bam_get_qual(b);
     int ncig = b->core.n_cigar;
     int ndel = 0;
+
+    hts_pos_t rstart = b->core.pos;
+    hts_pos_t rend = bam_endpos(b);
+#define VALID (rpos >= rstart && rpos <= rend)
+    //fprintf(stderr, "region %d..%d\n", rstart, rend);
+
+    // crude hack.  Also correct for STRs
+    if (trim_ends) {
+	rstart = trim_str(stat, ref_len, rstart, 1)+5;
+	rend   = trim_str(stat, ref_len, rend, -1)-5;
+    }
+    if (rend >= ref_len)
+	rend = ref_len-1;
 
 // 0x80 = ins                                   80-F0 1xxx ....
 // 0x80+uppercase = HOM ins (both alleles)      C0-D0 110x ....
@@ -581,20 +603,23 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref,
 		    if (V) printf("dm %ld\t%c %c *\n", rpos, rbase, qbase);
 #ifndef MATCH_ONLY
 		    // TYPE: undercall (cons has an insertion, we did not)
-		    incr_kmer2(bed_itr, rst, rpos, kmer, K_UNDER, qqual);
+		    if (VALID)
+			incr_kmer2(bed_itr, rst, rpos, kmer, K_UNDER, qqual);
 #endif
 		} else {
 		    if (qbase == ambig(rbase, qbase)) {
 			if (V>1)
 			    printf("M  %ld\t%c %c\n", rpos, rbase, qbase);
 			// TYPE: match-match
-			incr_kmer2(bed_itr, rst, rpos, kmer, K_MAT_M, qqual);
+			if (VALID)
+			    incr_kmer2(bed_itr, rst, rpos, kmer, K_MAT_M, qqual);
 		    } else if (rbase == '*') {
 			if (V)
 			    printf("im %ld\t%c %c *\n", rpos, rbase, qbase);
 #ifndef MATCH_ONLY
 			// TYPE: overcall
-			incr_kmer2(bed_itr, rst, rpos, kmer, K_OVER, qqual);
+			if (VALID)
+			    incr_kmer2(bed_itr, rst, rpos, kmer, K_OVER, qqual);
 #endif
 		    } else if (rbase != 'N') {
 			if (V) {
@@ -604,7 +629,8 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref,
 			}
 
 			// TYPE: substitution
-			incr_kmer2(bed_itr, rst, rpos, kmer, K_MIS_M, qqual);
+			if (VALID)
+			    incr_kmer2(bed_itr, rst, rpos, kmer, K_MIS_M, qqual);
 		    }
 		}
 
@@ -634,7 +660,7 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref,
 
 		    // 2nd alternative length based on heterozyugous ins
 		    // to consensus
-		    int ndel2 = 0, k = rpos+1;
+		    int ndel2 = 0, k = map[rpos]+1;
 		    while (ref[k] && isins(ref[k]))
 			ndel2 += isins_hom(ref[k++]);
 		    if (V)
@@ -651,7 +677,8 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref,
 			    printf("mD %ld\t. %c *\n", rpos,  qbase);
 #ifndef MATCH_ONLY
 			// TYPE: undercall (cons had insertion, we did not)
-			incr_kmer2(bed_itr, rst, rpos, kmer, K_UNDER, qqual);
+			if (VALID)
+			    incr_kmer2(bed_itr, rst, rpos, kmer, K_UNDER, qqual);
 #endif
 		    }
 		    //ndel-=(ndel>0);
@@ -670,20 +697,23 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref,
 			if (V>1) printf("mi %ld\t%c %c\n", rpos, rbase, qbase);
 #ifndef MATCH_ONLY
 			// TYPE: ins-match
-			incr_kmer2(bed_itr, rst, rpos, kmer, K_MAT_I, qqual);
+			if (VALID)
+			    incr_kmer2(bed_itr, rst, rpos, kmer, K_MAT_I, qqual);
 #endif
 		    } else {
 			if (V>1) printf("xi %ld\t%c %c\n", rpos, rbase, qbase);
 #ifndef MATCH_ONLY
 			// TYPE: ins-substitution
-			incr_kmer2(bed_itr, rst, rpos, kmer, K_MIS_I, qqual);
+			if (VALID)
+			    incr_kmer2(bed_itr, rst, rpos, kmer, K_MIS_I, qqual);
 #endif
 		    }
 		} else {
 		    if (V) printf("I  %ld\t. %c *\n", rpos, qbase);
 #ifndef MATCH_ONLY
 		    // TYPE: overcall (no insertion in cons)
-		    incr_kmer2(bed_itr, rst, rpos, kmer, K_OVER, qqual);
+		    if (VALID)
+			incr_kmer2(bed_itr, rst, rpos, kmer, K_OVER, qqual);
 #endif
 		}
 		qpos++;
@@ -697,7 +727,8 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref,
 		      bam_cigar_op(cig[i+1]) == BAM_CPAD)) {
 		    int ndel = map[rpos+1] - map[rpos] - 1 - cig_len;
 		    if (V) printf("Ins ended %d early\n", ndel);
-		    incr_kmer2(bed_itr, rst, rpos, kmer, K_UNDER, qqual);
+		    if (VALID)
+			incr_kmer2(bed_itr, rst, rpos, kmer, K_UNDER, qqual);
 		}
 		break;
 
@@ -706,13 +737,15 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref,
 		    if (V>1) printf("md %ld\t%c .\n", rpos, rbase);
 #ifndef MATCH_ONLY
 		    // TYPE: del-match
-		    incr_kmer2(bed_itr, rst, rpos, kmer, K_MAT_D, qqual);
+		    if (VALID)
+			incr_kmer2(bed_itr, rst, rpos, kmer, K_MAT_D, qqual);
 #endif
 		} else {
 		    if (V) printf("D  %ld\t%c . *\n", rpos, rbase);
 #ifndef MATCH_ONLY
 		    // TYPE: undercall
-		    incr_kmer2(bed_itr, rst, rpos, kmer, K_UNDER, qqual);
+		    if (VALID)
+			incr_kmer2(bed_itr, rst, rpos, kmer, K_UNDER, qqual);
 #endif
 		}
 		rpos++;
@@ -900,11 +933,16 @@ int main(int argc, char **argv) {
     regitr_t *bed_itr = NULL;
     char *reg = NULL;
     hts_itr_t *itr = NULL;
+    int trim_ends = 0;
 
     int c;
-    while ((c = getopt(argc, argv, "I:f:b:r:m")) >= 0) {
+    while ((c = getopt(argc, argv, "I:f:b:r:me")) >= 0) {
 	switch(c) {
 	case 'I': hts_parse_format(&in_fmt, optarg); break;
+
+	case 'e':
+	    trim_ends = 1;
+	    break;
 
 	case 'f':
 	    if (!(fai = fai_load(optarg))) {
@@ -997,7 +1035,8 @@ int main(int argc, char **argv) {
 	}
 	//puts(bam_get_qname(b));
 
-	accumulate_kmers(hdr, ref, stat, map, b, bed, bed_itr, mark_ins);
+	accumulate_kmers(hdr, ref, stat, ref_len,
+			 map, b, bed, bed_itr, mark_ins, trim_ends);
     }
     if (r != -1)
 	goto err;
