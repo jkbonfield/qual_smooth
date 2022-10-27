@@ -111,7 +111,7 @@ This gives us easier matching of nth base of insertion vs nth pos in ref.
  * => can map ref coords to sample coords.
  *
  * Or start with (note -m):
- * samtools consensus -a --show-del yes --mark-ins -r $REG in.bam > in.fa
+ * samtools consensus -A -a --show-del yes --mark-ins -r $REG in.bam > in.fa
  * ./qual_train -b truth.bed -m -f in.fa -r $REG in.bam
  */
 
@@ -417,10 +417,20 @@ int k_hist_qual2[WIN_LEN/2];
 int64_t k_num = 0;
 
 static hts_pos_t *global_map = NULL;
+static char global_cig_op;
 static inline void incr_kmer2(regitr_t *bed_itr, uint8_t stat, hts_pos_t rpos,
 			      uint32_t kmer, int type, int qual) {
     int ok = type<K_WRONG;
     int is_str = stat & ST_IN_STR ? 1 : 0;
+
+    // Debug
+    //if(1){
+    if (!ok && !is_str) {
+	char *s[] = {"MAT_M", "MAT_I", "MAT_D",
+		     "MIS_M", "MIS_I", "OVER", "UNDER"};
+	fprintf(stderr, "%s %c %5s %05o %2d %ld\n",
+		ok?"OK   ":"ERROR", global_cig_op, s[type], kmer, qual, rpos);
+    }
 
 //    printf("stat %2x Incr %05o %c %d %d %d\n", stat, kmer, K_CAT[type], ok, qual, type);
     if (in_bed(bed_itr, rpos)) {
@@ -555,6 +565,7 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref,
 	    uint32_t kmer = context_i(b, qpos);
 	    if (V>1) printf("%.5s\t%05o\t", context_s(b, qpos), kmer);
 
+	    global_cig_op = BAM_CIGAR_STR[cig_op];
 	    switch (cig_op) {
 	    case BAM_CSOFT_CLIP:
 		// Seq only, just ignore
@@ -619,8 +630,7 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref,
 			       bam_cigar_op(cig[i+1]) == BAM_CPAD))) {
 		    // Nominal deletion length
 		    if (!ndel)
-			ndel = map[rpos+1] - map[rpos] - 1 - WIN_LEN/2;
-		    ndel-=(ndel>0);
+			ndel = map[rpos+1] - map[rpos] - 1;// - WIN_LEN/2;
 
 		    // 2nd alternative length based on heterozyugous ins
 		    // to consensus
@@ -644,6 +654,10 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref,
 			incr_kmer2(bed_itr, rst, rpos, kmer, K_UNDER, qqual);
 #endif
 		    }
+		    //ndel-=(ndel>0);
+		    ndel = 0; // it's not in seq, so can only count once!
+		    // The neighbouring kmers will be skipped anyway as
+		    // we're following an error.
 		}
 
 		qpos++;
@@ -674,6 +688,17 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref,
 		}
 		qpos++;
 		nth++;
+
+		// Check if we end the insertion early
+		uint8_t rbase_next = ref[map[rpos]+nth];
+		if (j == cig_len-1 && isupper(rbase_next & 0x7f) &&
+		    map[rpos+1] - map[rpos] - 1 > cig_len && i < ncig &&
+		    !(bam_cigar_op(cig[i+1]) == BAM_CINS ||
+		      bam_cigar_op(cig[i+1]) == BAM_CPAD)) {
+		    int ndel = map[rpos+1] - map[rpos] - 1 - cig_len;
+		    if (V) printf("Ins ended %d early\n", ndel);
+		    incr_kmer2(bed_itr, rst, rpos, kmer, K_UNDER, qqual);
+		}
 		break;
 
 	    case BAM_CDEL:
@@ -817,8 +842,8 @@ void dump_kmers2(void) {
 
 		double err = (double)nerr / ncnt;
 		int qreal = nerr ? -10*log10(err)+.5 : 99;
-		int qcall = (int)(-4.343*log(qerr / ncnt)+.5);
-		int qcall2 = (int)(-4.343*log(qerr2 / ncnt)+.5);
+		int qcall = qerr ? (int)(-4.343*log(qerr / ncnt)+.5) : 99;
+		int qcall2 = qerr2 ? (int)(-4.343*log(qerr2 / ncnt)+.5) : 99;
 		char *s[] = {"MATCH", "UNDER", "OVER", "MAT_M", "MAT_I"};
 
 		printf("%05o ", i);
