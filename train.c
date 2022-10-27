@@ -418,10 +418,8 @@ int64_t k_num = 0;
 
 static hts_pos_t *global_map = NULL;
 static inline void incr_kmer2(regitr_t *bed_itr, uint8_t stat, hts_pos_t rpos,
-			      uint32_t kmer, int type, int ok, int qual) {
-    int ok2 = type<K_WRONG;
-    assert(ok == ok2);
-
+			      uint32_t kmer, int type, int qual) {
+    int ok = type<K_WRONG;
     int is_str = stat & ST_IN_STR ? 1 : 0;
 
 //    printf("stat %2x Incr %05o %c %d %d %d\n", stat, kmer, K_CAT[type], ok, qual, type);
@@ -572,20 +570,20 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref,
 		    if (V) printf("dm %ld\t%c %c *\n", rpos, rbase, qbase);
 #ifndef MATCH_ONLY
 		    // TYPE: undercall (cons has an insertion, we did not)
-		    incr_kmer2(bed_itr, rst, rpos, kmer, K_UNDER, 0, qqual);
+		    incr_kmer2(bed_itr, rst, rpos, kmer, K_UNDER, qqual);
 #endif
 		} else {
 		    if (qbase == ambig(rbase, qbase)) {
 			if (V>1)
 			    printf("M  %ld\t%c %c\n", rpos, rbase, qbase);
 			// TYPE: match-match
-			incr_kmer2(bed_itr, rst, rpos, kmer, K_MAT_M, 1, qqual);
+			incr_kmer2(bed_itr, rst, rpos, kmer, K_MAT_M, qqual);
 		    } else if (rbase == '*') {
 			if (V)
 			    printf("im %ld\t%c %c *\n", rpos, rbase, qbase);
 #ifndef MATCH_ONLY
 			// TYPE: overcall
-			incr_kmer2(bed_itr, rst, rpos, kmer, K_OVER, 0, qqual);
+			incr_kmer2(bed_itr, rst, rpos, kmer, K_OVER, qqual);
 #endif
 		    } else if (rbase != 'N') {
 			if (V) {
@@ -595,7 +593,7 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref,
 			}
 
 			// TYPE: substitution
-			incr_kmer2(bed_itr, rst, rpos, kmer, K_MIS_M, 0, qqual);
+			incr_kmer2(bed_itr, rst, rpos, kmer, K_MIS_M, qqual);
 		    }
 		}
 
@@ -643,7 +641,7 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref,
 			    printf("mD %ld\t. %c *\n", rpos,  qbase);
 #ifndef MATCH_ONLY
 			// TYPE: undercall (cons had insertion, we did not)
-			incr_kmer2(bed_itr, rst, rpos, kmer, K_UNDER, 0, qqual);
+			incr_kmer2(bed_itr, rst, rpos, kmer, K_UNDER, qqual);
 #endif
 		    }
 		}
@@ -658,20 +656,20 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref,
 			if (V>1) printf("mi %ld\t%c %c\n", rpos, rbase, qbase);
 #ifndef MATCH_ONLY
 			// TYPE: ins-match
-			incr_kmer2(bed_itr, rst, rpos, kmer, K_MAT_I, 1, qqual);
+			incr_kmer2(bed_itr, rst, rpos, kmer, K_MAT_I, qqual);
 #endif
 		    } else {
 			if (V>1) printf("xi %ld\t%c %c\n", rpos, rbase, qbase);
 #ifndef MATCH_ONLY
 			// TYPE: ins-substitution
-			incr_kmer2(bed_itr, rst, rpos, kmer, K_MIS_I, 0, qqual);
+			incr_kmer2(bed_itr, rst, rpos, kmer, K_MIS_I, qqual);
 #endif
 		    }
 		} else {
 		    if (V) printf("I  %ld\t. %c *\n", rpos, qbase);
 #ifndef MATCH_ONLY
 		    // TYPE: overcall (no insertion in cons)
-		    incr_kmer2(bed_itr, rst, rpos, kmer, K_OVER, 0, qqual);
+		    incr_kmer2(bed_itr, rst, rpos, kmer, K_OVER, qqual);
 #endif
 		}
 		qpos++;
@@ -683,13 +681,13 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref,
 		    if (V>1) printf("md %ld\t%c .\n", rpos, rbase);
 #ifndef MATCH_ONLY
 		    // TYPE: del-match
-		    incr_kmer2(bed_itr, rst, rpos, kmer, K_MAT_D, 1, qqual);
+		    incr_kmer2(bed_itr, rst, rpos, kmer, K_MAT_D, qqual);
 #endif
 		} else {
 		    if (V) printf("D  %ld\t%c . *\n", rpos, rbase);
 #ifndef MATCH_ONLY
 		    // TYPE: undercall
-		    incr_kmer2(bed_itr, rst, rpos, kmer, K_UNDER, 0, qqual);
+		    incr_kmer2(bed_itr, rst, rpos, kmer, K_UNDER, qqual);
 #endif
 		}
 		rpos++;
