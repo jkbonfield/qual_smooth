@@ -142,7 +142,7 @@ This gives us easier matching of nth base of insertion vs nth pos in ref.
 #define K_MAT_D 2 // match in D op
 
 // -- bad ones
-#define K_WRONG 3 // wrong below this point
+#define K_WRONG 3 // wrong above this point
 #define K_MIS_M 3 // mismatch in M op
 #define K_MIS_I 4 // mismatch in I op
 #define K_OVER  5 // overcall;  rogue I op
@@ -153,6 +153,7 @@ This gives us easier matching of nth base of insertion vs nth pos in ref.
 uint32_t (*k_count)[K_NCAT][2] = NULL;
 double   (*k_qual) [K_NCAT][2] = NULL;
 double   (*k_qual2)[K_NCAT][2][99] = NULL;
+static int q_cal[K_NCAT][2][99];
 
 #define ST_HALO 10 // distance from indel/str
 #define ST_NEAR_INS 1
@@ -499,8 +500,7 @@ static inline void incr_kmer2(regitr_t *bed_itr, uint8_t stat, hts_pos_t rpos,
 	    k_count[kmer][type][is_str]++;
 	    k_qual[kmer][type][is_str] += Perr[qual];
 	    k_qual2[kmer][type][is_str][qual]++;
-//	    if (kmer == 031022 && type == K_OVER)
-//		printf("31022: overcall with qual %d\n", qual);
+	    q_cal[type][is_str][qual]++;
 	    skipped=0;
 	}
 
@@ -518,6 +518,7 @@ static inline void incr_kmer2(regitr_t *bed_itr, uint8_t stat, hts_pos_t rpos,
 		    k_qual [k_hist_kmer[i]][k_hist_type[i]][k_hist_str[i]]
 			-= k_hist_qual[i];
 		    k_qual2[k_hist_kmer[i]][k_hist_type[i]][k_hist_str[i]][k_hist_qual2[i]]--;
+		    q_cal[k_hist_type[i]][k_hist_str[i]][k_hist_qual2[i]]--;
 		}
 		k_hist_type[i] = 99; // prevent double decr is more err
 	    }
@@ -962,6 +963,26 @@ void dump_kmers2(void) {
     }
 }
 
+// Just basic stats for now
+void dump_qcal(void) {
+    printf("\n");
+    printf("# nerr ntot called-q real-q\n");
+    int q;
+    for (q = 0; q < 99; q++) {
+	if (!q_cal[K_MIS_M][0][q])
+	    continue;
+	int nerr = q_cal[K_MIS_M][0][q]
+	         + q_cal[K_MIS_I][0][q]
+	         + q_cal[K_OVER ][0][q]
+	         + q_cal[K_UNDER][0][q];
+	int nmat = q_cal[K_MAT_M][0][q]
+	         + q_cal[K_MAT_I][0][q]
+	         + q_cal[K_MAT_D][0][q];
+	int err = (int)(-4.343*log((double)nerr/(nerr+nmat))+.5);
+	printf("QUAL\t%d\t%12d\t%d\t%d\n", nerr, nerr+nmat, q, err);
+    }
+}
+
 int main(int argc, char **argv) {
     samFile *fp = NULL;
     sam_hdr_t *hdr = NULL;
@@ -1092,6 +1113,7 @@ int main(int argc, char **argv) {
 
     //dump_kmers();
     dump_kmers2();
+    dump_qcal();
 
     return 0;
 
