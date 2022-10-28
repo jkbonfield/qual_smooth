@@ -424,6 +424,9 @@ double k_hist_qual[WIN_LEN/2];
 int k_hist_qual2[WIN_LEN/2];
 int64_t k_num = 0;
 
+// Substitution counts
+int64_t subst[6][6] = {0};
+
 static hts_pos_t *global_map = NULL;
 static char global_cig_op;
 static inline void incr_kmer2(regitr_t *bed_itr, uint8_t stat, hts_pos_t rpos,
@@ -433,13 +436,13 @@ static inline void incr_kmer2(regitr_t *bed_itr, uint8_t stat, hts_pos_t rpos,
 
     // Debug
     //if(1){
-    if (!ok) {
-	char *s[] = {"MAT_M", "MAT_I", "MAT_D",
-		     "MIS_M", "MIS_I", "OVER", "UNDER"};
-	fprintf(stderr, "%s %c %5s %05o %2d %ld  str %d\n",
-		ok?"OK   ":"ERROR", global_cig_op, s[type], kmer, qual, rpos,
-		is_str);
-    }
+//    if (!ok) {
+//	char *s[] = {"MAT_M", "MAT_I", "MAT_D",
+//		     "MIS_M", "MIS_I", "OVER", "UNDER"};
+//	fprintf(stderr, "%s %c %5s %05o %2d %ld  str %d\n",
+//		ok?"OK   ":"ERROR", global_cig_op, s[type], kmer, qual, rpos,
+//		is_str);
+//    }
 
 //    printf("stat %2x Incr %05o %c %d %d %d\n", stat, kmer, K_CAT[type], ok, qual, type);
     if (in_bed(bed_itr, rpos)) {
@@ -514,6 +517,7 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, const uint8_t *stat,
 	L['C'] = L['c'] = 1;
 	L['G'] = L['g'] = 2;
 	L['T'] = L['t'] = 3;
+	memcpy(&L[128], &L[0], 128);
 	L_done = 1;
 
 	kmer_count = calloc(WIN_MASK+1, sizeof(*kmer_count));
@@ -603,23 +607,29 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, const uint8_t *stat,
 		    if (V) printf("dm %ld\t%c %c *\n", rpos, rbase, qbase);
 #ifndef MATCH_ONLY
 		    // TYPE: undercall (cons has an insertion, we did not)
-		    if (VALID)
+		    if (VALID) {
 			incr_kmer2(bed_itr, rst, rpos, kmer, K_UNDER, qqual);
+			subst[L[rbase]][5]++;
+		    }
 #endif
 		} else {
 		    if (qbase == ambig(rbase, qbase)) {
 			if (V>1)
 			    printf("M  %ld\t%c %c\n", rpos, rbase, qbase);
 			// TYPE: match-match
-			if (VALID)
+			if (VALID) {
 			    incr_kmer2(bed_itr, rst, rpos, kmer, K_MAT_M, qqual);
+			    subst[L[rbase]][L[qbase]]++;
+			}
 		    } else if (rbase == '*') {
 			if (V)
 			    printf("im %ld\t%c %c *\n", rpos, rbase, qbase);
 #ifndef MATCH_ONLY
 			// TYPE: overcall
-			if (VALID)
+			if (VALID) {
 			    incr_kmer2(bed_itr, rst, rpos, kmer, K_OVER, qqual);
+			    subst[5][L[qbase]]++;
+			}
 #endif
 		    } else if (rbase != 'N') {
 			if (V) {
@@ -629,8 +639,10 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, const uint8_t *stat,
 			}
 
 			// TYPE: substitution
-			if (VALID)
+			if (VALID) {
 			    incr_kmer2(bed_itr, rst, rpos, kmer, K_MIS_M, qqual);
+			    subst[L[rbase]][L[qbase]]++;
+			}
 		    }
 		}
 
@@ -677,8 +689,10 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, const uint8_t *stat,
 			    printf("mD %ld\t. %c *\n", rpos,  qbase);
 #ifndef MATCH_ONLY
 			// TYPE: undercall (cons had insertion, we did not)
-			if (VALID)
+			if (VALID) {
 			    incr_kmer2(bed_itr, rst, rpos, kmer, K_UNDER, qqual);
+			    subst[L[rbase]][5]++;
+			}
 #endif
 		    }
 		    //ndel-=(ndel>0);
@@ -697,23 +711,29 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, const uint8_t *stat,
 			if (V>1) printf("mi %ld\t%c %c\n", rpos, rbase, qbase);
 #ifndef MATCH_ONLY
 			// TYPE: ins-match
-			if (VALID)
+			if (VALID) {
 			    incr_kmer2(bed_itr, rst, rpos, kmer, K_MAT_I, qqual);
+			    subst[L[rbase]][L[qbase]]++;
+			}
 #endif
 		    } else {
 			if (V>1) printf("xi %ld\t%c %c\n", rpos, rbase, qbase);
 #ifndef MATCH_ONLY
 			// TYPE: ins-substitution
-			if (VALID)
+			if (VALID) {
 			    incr_kmer2(bed_itr, rst, rpos, kmer, K_MIS_I, qqual);
+			    subst[L[rbase]][L[qbase]]++;
+			}
 #endif
 		    }
 		} else {
 		    if (V) printf("I  %ld\t. %c *\n", rpos, qbase);
 #ifndef MATCH_ONLY
 		    // TYPE: overcall (no insertion in cons)
-		    if (VALID)
+		    if (VALID) {
 			incr_kmer2(bed_itr, rst, rpos, kmer, K_OVER, qqual);
+			subst[5][L[qbase]]++;
+		    }
 #endif
 		}
 		qpos++;
@@ -727,8 +747,10 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, const uint8_t *stat,
 		      bam_cigar_op(cig[i+1]) == BAM_CPAD)) {
 		    int ndel = map[rpos+1] - map[rpos] - 1 - cig_len;
 		    if (V) printf("Ins ended %d early\n", ndel);
-		    if (VALID)
+		    if (VALID) {
 			incr_kmer2(bed_itr, rst, rpos, kmer, K_UNDER, qqual);
+			subst[L[rbase]][5]++;
+		    }
 		}
 		break;
 
@@ -739,13 +761,16 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, const uint8_t *stat,
 		    // TYPE: del-match
 		    if (VALID)
 			incr_kmer2(bed_itr, rst, rpos, kmer, K_MAT_D, qqual);
+
 #endif
 		} else {
 		    if (V) printf("D  %ld\t%c . *\n", rpos, rbase);
 #ifndef MATCH_ONLY
 		    // TYPE: undercall
-		    if (VALID)
+		    if (VALID) {
 			incr_kmer2(bed_itr, rst, rpos, kmer, K_UNDER, qqual);
+			subst[L[rbase]][5]++;
+		    }
 #endif
 		}
 		rpos++;
@@ -919,6 +944,18 @@ void dump_qcal(void) {
     }
 }
 
+// Overall base substitution matrix.
+void dump_subst(void) {
+    printf("\n# Substitutions; row = from, col = to\n");
+    printf("#            A            C            G            T            N            *\n");
+    for (int i = 0; i < 6; i++) {
+	printf("%c", "ACGTN*"[i]);
+	for (int j = 0; j < 6; j++)
+	    printf(" %12ld", subst[i][j]);
+	printf("\n");
+    }
+}
+
 int main(int argc, char **argv) {
     samFile *fp = NULL;
     sam_hdr_t *hdr = NULL;
@@ -1055,6 +1092,7 @@ int main(int argc, char **argv) {
 
     dump_kmers2();
     dump_qcal();
+    dump_subst();
 
     return 0;
 
