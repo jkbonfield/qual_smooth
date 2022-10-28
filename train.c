@@ -425,7 +425,7 @@ int k_hist_qual2[WIN_LEN/2];
 int64_t k_num = 0;
 
 // Substitution counts
-int64_t subst[6][6] = {0};
+int64_t subst[99][6][6] = {0};
 
 static hts_pos_t *global_map = NULL;
 static char global_cig_op;
@@ -609,7 +609,7 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, const uint8_t *stat,
 		    // TYPE: undercall (cons has an insertion, we did not)
 		    if (VALID) {
 			incr_kmer2(bed_itr, rst, rpos, kmer, K_UNDER, qqual);
-			subst[L[rbase]][5]++;
+			subst[qqual][L[rbase]][5]++;
 		    }
 #endif
 		} else {
@@ -619,7 +619,7 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, const uint8_t *stat,
 			// TYPE: match-match
 			if (VALID) {
 			    incr_kmer2(bed_itr, rst, rpos, kmer, K_MAT_M, qqual);
-			    subst[L[rbase]][L[qbase]]++;
+			    subst[qqual][L[rbase]][L[qbase]]++;
 			}
 		    } else if (rbase == '*') {
 			if (V)
@@ -628,7 +628,7 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, const uint8_t *stat,
 			// TYPE: overcall
 			if (VALID) {
 			    incr_kmer2(bed_itr, rst, rpos, kmer, K_OVER, qqual);
-			    subst[5][L[qbase]]++;
+			    subst[qqual][5][L[qbase]]++;
 			}
 #endif
 		    } else if (rbase != 'N') {
@@ -641,7 +641,7 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, const uint8_t *stat,
 			// TYPE: substitution
 			if (VALID) {
 			    incr_kmer2(bed_itr, rst, rpos, kmer, K_MIS_M, qqual);
-			    subst[L[rbase]][L[qbase]]++;
+			    subst[qqual][L[rbase]][L[qbase]]++;
 			}
 		    }
 		}
@@ -694,7 +694,7 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, const uint8_t *stat,
 			// TYPE: undercall (cons had insertion, we did not)
 			if (VALID) {
 			    incr_kmer2(bed_itr, rst, rpos, kmer, K_UNDER, qqual);
-			    subst[L[rbase]][5]++;
+			    subst[qqual][L[rbase]][5]++;
 			}
 #endif
 		    }
@@ -716,7 +716,7 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, const uint8_t *stat,
 			// TYPE: ins-match
 			if (VALID) {
 			    incr_kmer2(bed_itr, rst, rpos, kmer, K_MAT_I, qqual);
-			    subst[L[rbase]][L[qbase]]++;
+			    subst[qqual][L[rbase]][L[qbase]]++;
 			}
 #endif
 		    } else {
@@ -725,7 +725,7 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, const uint8_t *stat,
 			// TYPE: ins-substitution
 			if (VALID) {
 			    incr_kmer2(bed_itr, rst, rpos, kmer, K_MIS_I, qqual);
-			    subst[L[rbase]][L[qbase]]++;
+			    subst[qqual][L[rbase]][L[qbase]]++;
 			}
 #endif
 		    }
@@ -735,7 +735,7 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, const uint8_t *stat,
 		    // TYPE: overcall (no insertion in cons)
 		    if (VALID) {
 			incr_kmer2(bed_itr, rst, rpos, kmer, K_OVER, qqual);
-			subst[5][L[qbase]]++;
+			subst[qqual][5][L[qbase]]++;
 		    }
 #endif
 		}
@@ -752,7 +752,7 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, const uint8_t *stat,
 		    if (V) printf("Ins ended %d early\n", ndel);
 		    if (VALID) {
 			incr_kmer2(bed_itr, rst, rpos, kmer, K_UNDER, qqual);
-			subst[L[rbase]][5]++;
+			subst[qqual][L[rbase]][5]++;
 		    }
 		}
 		break;
@@ -772,7 +772,7 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, const uint8_t *stat,
 		    // TYPE: undercall
 		    if (VALID) {
 			incr_kmer2(bed_itr, rst, rpos, kmer, K_UNDER, qqual);
-			subst[L[rbase]][5]++;
+			subst[qqual][L[rbase]][5]++;
 		    }
 #endif
 		}
@@ -948,13 +948,17 @@ void dump_qcal(void) {
 }
 
 // Overall base substitution matrix.
-void dump_subst(void) {
+void dump_subst(int min_q) {
     printf("\n# Substitutions; row = from, col = to\n");
     printf("#                 A           C           G           T           N           *\n");
     for (int i = 0; i < 6; i++) {
 	printf("SUBST %c", "ACGTN*"[i]);
-	for (int j = 0; j < 6; j++)
-	    printf(" %11ld", subst[i][j]);
+	for (int j = 0; j < 6; j++) {
+	    uint64_t tot = 0;
+	    for (int q = min_q; q < 99; q++) 
+		tot += subst[q][i][j];
+	    printf(" %11ld", tot);
+	}
 	printf("\n");
     }
 }
@@ -1095,7 +1099,7 @@ int main(int argc, char **argv) {
 
     dump_kmers2();
     dump_qcal();
-    dump_subst();
+    dump_subst(30);
 
     return 0;
 
