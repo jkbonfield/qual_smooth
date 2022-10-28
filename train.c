@@ -663,9 +663,12 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, const uint8_t *stat,
 		// Ie if this was HOM INS, it'd be ndel=2, despite
 		// map[rpos+1]-map[rpos]-1 being 1, as we have to add
 		// the D in too.  Maybe that's covered by CDEL below?
-		if (ndel || (map[rpos+1] - map[rpos] != 1 && i < ncig &&
-			     !(bam_cigar_op(cig[i+1]) == BAM_CINS ||
-			       bam_cigar_op(cig[i+1]) == BAM_CPAD))) {
+		if (ndel || (map[rpos+1] - map[rpos] != 1 &&
+			     (j < cig_len-1 // middle of M op
+			      ||            // end of M op and not I next
+			      (i < ncig &&
+			       (!(bam_cigar_op(cig[i+1]) == BAM_CINS ||
+				  bam_cigar_op(cig[i+1]) == BAM_CPAD)))))) {
 		    // Nominal deletion length
 		    if (!ndel)
 			ndel = map[rpos+1] - map[rpos] - 1;// - WIN_LEN/2;
