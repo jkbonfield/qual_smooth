@@ -667,8 +667,8 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, const uint8_t *stat,
 			     (j < cig_len-1 // middle of M op
 			      ||            // end of M op and not I next
 			      (i < ncig &&
-			       (!(bam_cigar_op(cig[i+1]) == BAM_CINS ||
-				  bam_cigar_op(cig[i+1]) == BAM_CPAD)))))) {
+			       bam_cigar_op(cig[i+1]) != BAM_CINS &&
+			       bam_cigar_op(cig[i+1]) != BAM_CPAD)))) {
 		    // Nominal deletion length
 		    if (!ndel)
 			ndel = map[rpos+1] - map[rpos] - 1;// - WIN_LEN/2;
@@ -950,11 +950,11 @@ void dump_qcal(void) {
 // Overall base substitution matrix.
 void dump_subst(void) {
     printf("\n# Substitutions; row = from, col = to\n");
-    printf("#            A            C            G            T            N            *\n");
+    printf("#                 A           C           G           T           N           *\n");
     for (int i = 0; i < 6; i++) {
-	printf("%c", "ACGTN*"[i]);
+	printf("SUBST %c", "ACGTN*"[i]);
 	for (int j = 0; j < 6; j++)
-	    printf(" %12ld", subst[i][j]);
+	    printf(" %11ld", subst[i][j]);
 	printf("\n");
     }
 }
