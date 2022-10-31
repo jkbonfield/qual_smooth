@@ -176,13 +176,6 @@ double Perr[256];
 #define KINS   1 // matching insertion
 #define KDEL   2 // matching deletion
 
-// Accumulate on orig seq strand only.
-//
-// This may not be as useful as it sounds as gaps during alignment get
-// left justified regardless of orientations.  It works OK for mismatches
-// though.
-#define DO_REVERSE
-
 // Ignore indel cases, so match-pileups only
 //#define MATCH_ONLY
 
@@ -368,7 +361,7 @@ static char *context_s(bam1_t *b, int pos) {
 // ACGTN -> {0..4}, 3 bits at a time.
 // NOTE: this could be more efficient via a rolling kmer rather than
 // recomputing it every time.  This is here for simplicity currently.
-static uint32_t context_i(bam1_t *b, int pos) {
+static uint32_t context_i(bam1_t *b, int pos, int do_rev) {
     uint8_t *seq = bam_get_seq(b);
     int len = b->core.l_qseq;
     uint32_t ctx = 0;
@@ -376,29 +369,28 @@ static uint32_t context_i(bam1_t *b, int pos) {
     // FIXME: switch to two versions for reverse or orig rather than
     // one vers and a second loop to reverse.
 
-#ifdef DO_REVERSE
-    int shift = (b->core.flag & BAM_FREVERSE) ? -WIN_SHIFT : WIN_SHIFT;
-#else
-    int shift = WIN_SHIFT;
-#endif
+    int shift = do_rev
+	? ((b->core.flag & BAM_FREVERSE) ? -WIN_SHIFT : WIN_SHIFT)
+	: WIN_SHIFT;
+
     for (int i = 0, j = pos-WIN_LEN/2+shift; i < WIN_LEN; i++, j++)
 	ctx = (ctx<<3) | 
 	    (j >= 0 && j < len
 	     ? seq_nt16_int[bam_seqi(seq, j)]
 	     : 4);
 
-#ifdef DO_REVERSE
-    if (b->core.flag & BAM_FREVERSE) {
-	uint32_t ctx2 = 0;
-	//fprintf(stderr, "%05o ", ctx);
-	for (int i = 0; i < WIN_LEN; i++) {
-	    ctx2 = (ctx2<<3) | ((ctx & 7)^3);
-	    ctx >>= 3;
+    if (do_rev) {
+	if (b->core.flag & BAM_FREVERSE) {
+	    uint32_t ctx2 = 0;
+	    //fprintf(stderr, "%05o ", ctx);
+	    for (int i = 0; i < WIN_LEN; i++) {
+		ctx2 = (ctx2<<3) | ((ctx & 7)^3);
+		ctx >>= 3;
+	    }
+	    //fprintf(stderr, "%05o\n", ctx2);
+	    ctx = ctx2;
 	}
-	//fprintf(stderr, "%05o\n", ctx2);
-	ctx = ctx2;
     }
-#endif
 
     return ctx;
 }
@@ -426,6 +418,8 @@ int64_t k_num = 0;
 
 // Substitution counts
 int64_t subst[99][6][6] = {0};
+// ACGT (0123) -> TGCA (3210) == x^3
+#define RC(x) (do_rev && (b->core.flag & BAM_FREVERSE) && (x)<=3 ? (x)^3 : (x))
 
 static hts_pos_t *global_map = NULL;
 static char global_cig_op;
@@ -503,7 +497,7 @@ static inline void incr_kmer2(regitr_t *bed_itr, uint8_t stat, hts_pos_t rpos,
 void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, const uint8_t *stat,
 		      hts_pos_t ref_len, hts_pos_t *map,
 		      bam1_t *b, regidx_t *bed, regitr_t *bed_itr,
-		      int mark_ins, int trim_ends) {
+		      int mark_ins, int trim_ends, int do_rev) {
     const int V=0; // DEBUG only
 
     if (bed_itr)
@@ -588,7 +582,7 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, const uint8_t *stat,
 	    uint8_t rbase = ref[map[rpos]+nth];
 	    uint8_t rst   = stat[map[rpos]+nth];
 
-	    uint32_t kmer = context_i(b, qpos);
+	    uint32_t kmer = context_i(b, qpos, do_rev);
 	    if (V>1) printf("%.5s\t%05o\t", context_s(b, qpos), kmer);
 
 	    global_cig_op = BAM_CIGAR_STR[cig_op];
@@ -609,7 +603,7 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, const uint8_t *stat,
 		    // TYPE: undercall (cons has an insertion, we did not)
 		    if (VALID) {
 			incr_kmer2(bed_itr, rst, rpos, kmer, K_UNDER, qqual);
-			subst[qqual][L[rbase]][5]++;
+			subst[qqual][RC(L[rbase])][5]++;
 		    }
 #endif
 		} else {
@@ -619,7 +613,7 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, const uint8_t *stat,
 			// TYPE: match-match
 			if (VALID) {
 			    incr_kmer2(bed_itr, rst, rpos, kmer, K_MAT_M, qqual);
-			    subst[qqual][L[rbase]][L[qbase]]++;
+			    subst[qqual][RC(L[rbase])][RC(L[qbase])]++;
 			}
 		    } else if (rbase == '*') {
 			if (V)
@@ -628,7 +622,7 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, const uint8_t *stat,
 			// TYPE: overcall
 			if (VALID) {
 			    incr_kmer2(bed_itr, rst, rpos, kmer, K_OVER, qqual);
-			    subst[qqual][5][L[qbase]]++;
+			    subst[qqual][5][RC(L[qbase])]++;
 			}
 #endif
 		    } else if (rbase != 'N') {
@@ -641,7 +635,7 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, const uint8_t *stat,
 			// TYPE: substitution
 			if (VALID) {
 			    incr_kmer2(bed_itr, rst, rpos, kmer, K_MIS_M, qqual);
-			    subst[qqual][L[rbase]][L[qbase]]++;
+			    subst[qqual][RC(L[rbase])][RC(L[qbase])]++;
 			}
 		    }
 		}
@@ -694,7 +688,7 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, const uint8_t *stat,
 			// TYPE: undercall (cons had insertion, we did not)
 			if (VALID) {
 			    incr_kmer2(bed_itr, rst, rpos, kmer, K_UNDER, qqual);
-			    subst[qqual][L[rbase]][5]++;
+			    subst[qqual][RC(L[rbase])][5]++;
 			}
 #endif
 		    }
@@ -716,7 +710,7 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, const uint8_t *stat,
 			// TYPE: ins-match
 			if (VALID) {
 			    incr_kmer2(bed_itr, rst, rpos, kmer, K_MAT_I, qqual);
-			    subst[qqual][L[rbase]][L[qbase]]++;
+			    subst[qqual][RC(L[rbase])][RC(L[qbase])]++;
 			}
 #endif
 		    } else {
@@ -725,7 +719,7 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, const uint8_t *stat,
 			// TYPE: ins-substitution
 			if (VALID) {
 			    incr_kmer2(bed_itr, rst, rpos, kmer, K_MIS_I, qqual);
-			    subst[qqual][L[rbase]][L[qbase]]++;
+			    subst[qqual][RC(L[rbase])][RC(L[qbase])]++;
 			}
 #endif
 		    }
@@ -735,7 +729,7 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, const uint8_t *stat,
 		    // TYPE: overcall (no insertion in cons)
 		    if (VALID) {
 			incr_kmer2(bed_itr, rst, rpos, kmer, K_OVER, qqual);
-			subst[qqual][5][L[qbase]]++;
+			subst[qqual][5][RC(L[qbase])]++;
 		    }
 #endif
 		}
@@ -752,7 +746,7 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, const uint8_t *stat,
 		    if (V) printf("Ins ended %d early\n", ndel);
 		    if (VALID) {
 			incr_kmer2(bed_itr, rst, rpos, kmer, K_UNDER, qqual);
-			subst[qqual][L[rbase]][5]++;
+			subst[qqual][RC(L[rbase])][5]++;
 		    }
 		}
 		break;
@@ -772,7 +766,7 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, const uint8_t *stat,
 		    // TYPE: undercall
 		    if (VALID) {
 			incr_kmer2(bed_itr, rst, rpos, kmer, K_UNDER, qqual);
-			subst[qqual][L[rbase]][5]++;
+			subst[qqual][RC(L[rbase])][5]++;
 		    }
 #endif
 		}
@@ -978,11 +972,17 @@ int main(int argc, char **argv) {
     char *reg = NULL;
     hts_itr_t *itr = NULL;
     int trim_ends = 0;
+    int do_rev = 1;
+    int min_qual = 30; // for overall subst table.
 
     int c;
-    while ((c = getopt(argc, argv, "I:f:b:r:me")) >= 0) {
+    while ((c = getopt(argc, argv, "I:f:b:r:mesq:")) >= 0) {
 	switch(c) {
 	case 'I': hts_parse_format(&in_fmt, optarg); break;
+
+	case 's': //SAM strand instead of original orientation.
+	    do_rev = 0;
+	    break;
 
 	case 'e':
 	    trim_ends = 1;
@@ -1009,6 +1009,10 @@ int main(int argc, char **argv) {
 
 	case 'r':
 	    reg = optarg;
+	    break;
+
+	case 'q':
+	    min_qual = atoi(optarg);
 	    break;
 
 	case '?':
@@ -1080,7 +1084,7 @@ int main(int argc, char **argv) {
 	//puts(bam_get_qname(b));
 
 	accumulate_kmers(hdr, ref, stat, ref_len,
-			 map, b, bed, bed_itr, mark_ins, trim_ends);
+			 map, b, bed, bed_itr, mark_ins, trim_ends, do_rev);
     }
     if (r != -1)
 	goto err;
@@ -1099,7 +1103,7 @@ int main(int argc, char **argv) {
 
     dump_kmers2();
     dump_qcal();
-    dump_subst(30);
+    dump_subst(min_qual);
 
     return 0;
 
