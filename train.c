@@ -423,6 +423,7 @@ int64_t subst[99][6][6] = {0};
 
 static hts_pos_t *global_map = NULL;
 static char global_cig_op;
+static int ignore_neighbours = 1;
 static inline void incr_kmer2(regitr_t *bed_itr, uint8_t stat, hts_pos_t rpos,
 			      uint32_t kmer, int type, int qual) {
     int ok = type<K_WRONG;
@@ -456,8 +457,12 @@ static inline void incr_kmer2(regitr_t *bed_itr, uint8_t stat, hts_pos_t rpos,
 	    skipped=0;
 	}
 
-	// Revert to ignore
-	if (!ok) {
+	// Revert to ignore.
+	// Should we do this?  On one hand, it shows us kmers for accurate
+	// flanking bases so we can see specifically just the middle.
+	// On the other hand, in real life we don't know if the flanking is
+	// correct so this doesn't help train.
+	if (!ok && ignore_neighbours) {
 	    for (int i = 0; i < WIN_LEN/2; i++) {
 		int h_ok = k_hist_type[i] < K_WRONG;
 //		printf("%s %05o to ignore, count %d type %d\n",
@@ -1013,8 +1018,10 @@ int main(int argc, char **argv) {
     int min_qual = 30; // for overall subst table.
 
     int c;
-    while ((c = getopt(argc, argv, "I:f:b:r:mesq:")) >= 0) {
+    while ((c = getopt(argc, argv, "I:f:b:r:mesq:N")) >= 0) {
 	switch(c) {
+	case 'N': ignore_neighbours = 0; break;
+
 	case 'I': hts_parse_format(&in_fmt, optarg); break;
 
 	case 's': //SAM strand instead of original orientation.
