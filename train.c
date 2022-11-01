@@ -145,7 +145,7 @@ This gives us easier matching of nth base of insertion vs nth pos in ref.
 // [4<<WIN_LEN][TYPE][IS_STR]
 uint32_t (*k_count)[K_NCAT][2] = NULL;
 double   (*k_qual) [K_NCAT][2] = NULL;
-double   (*k_qual2)[K_NCAT][2][99] = NULL;
+double   (*k_qual2)[K_NCAT][2][100] = NULL;
 static int q_cal[K_NCAT][2][99];
 
 #define ST_HALO 10 // distance from indel/str
@@ -210,11 +210,11 @@ hts_pos_t *build_ref_map(uint8_t *ref, hts_pos_t *len_p, uint8_t *stat,
     if (!map)
 	return NULL;
 
-    fprintf(stderr, "Finding STRs\n");
+    //fprintf(stderr, "Finding STRs\n");
     // Find and mark STRs
     rep_ele *reps, *elt, *tmp;
     reps = find_STR((char *)ref, len, 0);
-    fprintf(stderr, "Marking STRs\n");
+    //fprintf(stderr, "Marking STRs\n");
     DL_FOREACH_SAFE(reps, elt, tmp) {
 //        printf("%2d .. %2d %2d %.*s\n", elt->start, elt->end, elt->rep_len,
 //               elt->end - elt->start+1, &ref[elt->start]);
@@ -236,7 +236,7 @@ hts_pos_t *build_ref_map(uint8_t *ref, hts_pos_t *len_p, uint8_t *stat,
 	DL_DELETE(reps, elt);
 	free(elt);
     }
-    fprintf(stderr, "Accumulating kmers\n");
+    //fprintf(stderr, "Accumulating kmers\n");
 
     // As we have deletions shown, can guarantee ref_len <= cons_len.
     hts_pos_t i, r;
@@ -826,9 +826,9 @@ void dump_kmers2(void) {
 	    if (!ntot)
 		continue;
 
+	    int nerr, ncnt;
+	    double qerr;
 	    for (k = 0; k < 5; k++) {
-		int nerr, ncnt;
-		double qerr;
 		qerr = k_qual[i][K_MAT_M][STR]
 		    + k_qual[i][K_MAT_I][STR]
 		    + k_qual[i][K_MAT_D][STR]
@@ -840,7 +840,6 @@ void dump_kmers2(void) {
 		    qerr2 += Perr[z]*k_qual2[i][K_MAT_M][STR][z];
 		    qerr2 += Perr[z]*k_qual2[i][K_MAT_I][STR][z];
 		    qerr2 += Perr[z]*k_qual2[i][K_MAT_D][STR][z];
-		    qerr2 += Perr[z]*k_qual2[i][K_MAT_M][STR][z];
 		    qerr2 += Perr[z]*k_qual2[i][K_MIS_M][STR][z];
 		    qerr2 += Perr[z]*k_qual2[i][K_MIS_I][STR][z];
 		}
@@ -908,6 +907,44 @@ void dump_kmers2(void) {
 		       s[k], is_str, nerr, ncnt, qreal, qcall,qcall2);
 	    
 	    }
+
+	    // All combined; this is the context we see for a variant caller
+	    // as we don't know the sample consensus so we can't determine
+	    // indels from substitutions etc (unless we wish to do a
+	    // series of hypothetical calls to further improve the scores
+	    // and pick which works best).
+	    double qerr2 = 0;
+	    for (int z = 99; z >= 0; z--) {
+		// amortised phred error score
+		qerr2 += Perr[z]*k_qual2[i][K_MAT_M][STR][z];
+		qerr2 += Perr[z]*k_qual2[i][K_MAT_I][STR][z];
+		qerr2 += Perr[z]*k_qual2[i][K_MAT_D][STR][z];
+		qerr2 += Perr[z]*k_qual2[i][K_MIS_I][STR][z];
+		qerr2 += Perr[z]*k_qual2[i][K_UNDER][STR][z];
+		qerr2 += Perr[z]*k_qual2[i][K_OVER][STR][z];
+	    }
+	    qerr = k_qual[i][K_MAT_M][STR]
+		 + k_qual[i][K_MAT_I][STR]
+		 + k_qual[i][K_MAT_D][STR]
+		 + k_qual[i][K_MIS_M][STR]
+		 + k_qual[i][K_MIS_I][STR]
+		 + k_qual[i][K_UNDER][STR]
+		 + k_qual[i][K_OVER][STR];
+	    ncnt = ntot;
+	    nerr = nsubst + nunder + nover;
+	    if (!nerr) continue;
+
+	    double err = (double)nerr / ncnt;
+	    int qreal = nerr ? -10*log10(err)+.5 : 99;
+	    int qcall = qerr ? (int)(-4.343*log(qerr / ncnt)+.5) : 99;
+	    int qcall2 = qerr2 ? (int)(-4.343*log(qerr2 / ncnt)+.5) : 99;
+
+	    printf("%05o ", i);
+	    for (j = WIN_LEN-1; j >= 0; j--)
+		putchar("ACGTNNNN"[(i>>(j*3))&7]);
+	    printf("\tALL%d\t%12d\t%12d\t%d\t%d\t%d\n",
+		   is_str, nerr, ncnt, qreal, qcall,qcall2);
+
 
 	    // is_str==2 is sum of 0 and 1, so add 1 into 0 and use str&1
 	    if (is_str == 1) {
@@ -1063,7 +1100,7 @@ int main(int argc, char **argv) {
 	if (b->core.tid < 0)
 	    continue;
 	if (b->core.tid != last_tid) {
-	    fprintf(stderr, "Fetching ref sequence\n");
+	    //fprintf(stderr, "Fetching ref sequence\n");
 	    if (ref)
 		free(ref);
 	    ref = (uint8_t *)
