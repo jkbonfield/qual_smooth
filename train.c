@@ -408,6 +408,22 @@ int in_bed(regitr_t *bed_itr, hts_pos_t pos) {
     return pos >= bed_itr->beg && pos <= bed_itr->end ? 1 : 0;
 }
 
+// // global hack
+// hts_pos_t *map_global = NULL;
+// uint8_t *ref_global = NULL;
+// hts_pos_t ref_len_global = 0;
+// int near_N(hts_pos_t rpos) {
+//     hts_pos_t i, j = map_global[rpos];;
+//     for (i = -20; i < +20; i++) {
+// 	if (i+j < 0 || i+j >= ref_len_global)
+// 	    continue;
+// 	if ((ref_global[i+j] & 0x7f) == 'N')
+// 	    return 1;
+//     }
+// 
+//     return 0;
+// }
+
 int k_skip = 0;
 int k_hist_kmer[WIN_LEN/2];
 int k_hist_type[WIN_LEN/2];
@@ -440,7 +456,7 @@ static inline void incr_kmer2(regitr_t *bed_itr, uint8_t stat, hts_pos_t rpos,
 //    }
 
 //    printf("stat %2x Incr %05o %c %d %d %d\n", stat, kmer, K_CAT[type], ok, qual, type);
-    if (in_bed(bed_itr, rpos)) {
+    if (in_bed(bed_itr, rpos) /*&& !near_N(rpos)*/) {
 	// Keep list of last WIN_LEN/2 kmers added (if OK), so we can
 	// undo them if we add a not-OK one.  Similarly track the numeber
 	// of subsequent kmers to skip (if OK).
@@ -504,6 +520,10 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, const uint8_t *stat,
 		      bam1_t *b, regidx_t *bed, regitr_t *bed_itr,
 		      int mark_ins, int trim_ends, int do_rev) {
     const int V=0; // DEBUG only
+
+//    map_global = map; // HACK
+//    ref_global = ref;
+//    ref_len_global = ref_len;
 
     if (bed_itr)
 	regidx_overlap(bed, sam_hdr_tid2name(hdr, b->core.tid),
