@@ -25,7 +25,7 @@ plot x lt 0 notitle, \\
 "<grep OVER2  $fn" using (\$6+rand(0)):(\$8+rand(0)):2 with labels hypertext point lt 7 ps 0.3 lc 8 title "Overcall", \\
 "<grep UNDER2 $fn" using (\$6+rand(0)):(\$8+rand(0)):2 with labels hypertext point lt 7 ps 0.2 lc 20 title "Undercall", \\
 "<grep ALL2   $fn" using (\$6+rand(0)):(\$8+rand(0)):2 with labels hypertext point lt 7 ps 0.1 lc 11 title "Combined", \\
-"<grep QUAL   $fn" using 4:5 with linespoints lw 2 lc 4 title "Qual"
+"<grep QUAL   $fn | grep -v -- -2147" using 5:4 with linespoints lw 2 lc 4 title "Qual"
 EOF
 ;
 

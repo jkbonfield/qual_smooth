@@ -146,7 +146,7 @@ This gives us easier matching of nth base of insertion vs nth pos in ref.
 uint32_t (*k_count)[K_NCAT][2] = NULL;
 double   (*k_qual) [K_NCAT][2] = NULL;
 double   (*k_qual2)[K_NCAT][2][100] = NULL;
-static int q_cal[K_NCAT][2][99];
+static long q_cal[K_NCAT][2][99];
 
 #define ST_HALO 10 // distance from indel/str
 #define ST_NEAR_INS 1
@@ -985,15 +985,15 @@ void dump_qcal(void) {
     for (q = 0; q < 99; q++) {
 	if (!q_cal[K_MIS_M][0][q])
 	    continue;
-	int nerr = q_cal[K_MIS_M][0][q]
-	         + q_cal[K_MIS_I][0][q]
-	         + q_cal[K_OVER ][0][q]
-	         + q_cal[K_UNDER][0][q];
-	int nmat = q_cal[K_MAT_M][0][q]
-	         + q_cal[K_MAT_I][0][q]
-	         + q_cal[K_MAT_D][0][q];
+	long nerr = q_cal[K_MIS_M][0][q]
+	          + q_cal[K_MIS_I][0][q]
+	          + q_cal[K_OVER ][0][q]
+	          + q_cal[K_UNDER][0][q];
+	long nmat = q_cal[K_MAT_M][0][q]
+	          + q_cal[K_MAT_I][0][q]
+	          + q_cal[K_MAT_D][0][q];
 	int err = (int)(-4.343*log((double)nerr/(nerr+nmat))+.5);
-	printf("QUAL\t%d\t%12d\t%d\t%d\n", nerr, nerr+nmat, q, err);
+	printf("QUAL\t%ld\t%12ld\t%d\t%d\n", nerr, nerr+nmat, q, err);
     }
 }
 
