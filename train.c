@@ -998,11 +998,11 @@ void dump_qcal(void) {
 }
 
 // Overall base substitution matrix.
-void dump_subst(int min_q) {
-    printf("\n# Substitutions; row = from, col = to\n");
-    printf("#                 A           C           G           T           N           *\n");
+void dump_subst(int min_q, char *prefix) {
+    printf("\n# Substitutions at Q >= %d; row = from, col = to\n", min_q);
+    printf("%s #           A           C           G           T           N           *\n", prefix);
     for (int i = 0; i < 6; i++) {
-	printf("SUBST %c", "ACGTN*"[i]);
+	printf("%s %c", prefix, "ACGTN*"[i]);
 	for (int j = 0; j < 6; j++) {
 	    uint64_t tot = 0;
 	    for (int q = min_q; q < 99; q++) 
@@ -1161,7 +1161,8 @@ int main(int argc, char **argv) {
 
     dump_kmers2();
     dump_qcal();
-    dump_subst(min_qual);
+    dump_subst(min_qual, "SUBST_HQ");
+    dump_subst(0, "SUBST_ALL");
 
     return 0;
 
