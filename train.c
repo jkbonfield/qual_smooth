@@ -154,12 +154,6 @@ static long q_cal[K_NCAT][2][99];
 #define ST_NEAR_STR 4
 #define ST_IN_STR   8
 
-
-
-// [4<<WIN_LEN][TYPE][IS_CORRECT]  (type being match, ins and del)
-uint32_t (*kmer_count)[3][2] = NULL; // counts of true and false bases
-double   (*kmer_qual)[3] = NULL;     // sum of estimated errors from qual
-int      (*kmer_qual2)[3][99] = NULL;     // sum of estimated errors from qual
 #define WIN_LEN 5
 #define WIN_SHIFT 0 // +ve => move right
 #define WIN_MASK ((1<<(3*WIN_LEN))-1)
@@ -524,6 +518,9 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, const uint8_t *stat,
 		      int mark_ins, int trim_ends, int do_rev) {
     const int V=0; // DEBUG only
 
+    if (b->core.l_qseq <= 0)
+	return;
+
 //    map_global = map; // HACK
 //    ref_global = ref;
 //    ref_len_global = ref_len;
@@ -542,23 +539,12 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, const uint8_t *stat,
 	memcpy(&L[128], &L[0], 128);
 	L_done = 1;
 
-	kmer_count = calloc(WIN_MASK+1, sizeof(*kmer_count));
-	kmer_qual  = malloc((WIN_MASK+1) * sizeof(*kmer_qual));
-	kmer_qual2 = calloc((WIN_MASK+1), sizeof(*kmer_qual2));
-	int i, j, k;
-	for (k = 0; k < WIN_MASK; k++)
-	    for (j = 0; j < 3; j++)
-		kmer_qual[k][j] = DBL_MIN;
-
 	k_count = calloc(WIN_MASK+1, sizeof(*k_count));
 	k_qual  = calloc(WIN_MASK+1, sizeof(*k_qual));
 	k_qual2 = calloc(WIN_MASK+1, sizeof(*k_qual2));
-	for (k = 0; k < WIN_MASK; k++)
-	    for (j = 0; j < K_NCAT; j++)
-		kmer_qual[k][j] = DBL_MIN;
 
 	Perr[0] = 1;
-	for (i = 1; i < 256; i++)
+	for (int i = 1; i < 256; i++)
 	    Perr[i] += pow(10, -i/10.0);
     }
 
@@ -607,6 +593,7 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, const uint8_t *stat,
 	for (int j = 0; j < cig_len; j++) {
 	    uint8_t qbase = seq_nt16_str[bam_seqi(qseq, qpos)];
 	    uint8_t qqual = qual[qpos];
+	    if (qqual > 93) qqual = 93;
 	    uint8_t rbase = ref[map[rpos]+nth];
 	    uint8_t rst   = stat[map[rpos]+nth];
 
