@@ -288,10 +288,14 @@ hts_pos_t *build_ref_map(uint8_t *ref, hts_pos_t *len_p, uint8_t *stat,
 }
 
 // March pos up or down until we're outside of a known STR
-hts_pos_t trim_str(const uint8_t *flags, hts_pos_t len, hts_pos_t pos,
-		   int dir) {
-    while (pos >= 0 && pos < len && (flags[pos] & ST_IN_STR))
-	pos += dir;
+hts_pos_t trim_str(const uint8_t *flags, hts_pos_t len,
+		   hts_pos_t pos, hts_pos_t end, int dir) {
+    if (dir > 0)
+	while (pos < len && (flags[pos] & ST_IN_STR) && pos < end)
+	    pos++;
+    else
+	while (pos > 0   && (flags[pos] & ST_IN_STR) && pos > end)
+	    pos--;
     return pos;
 }
 
@@ -563,8 +567,8 @@ void accumulate_kmers(sam_hdr_t *hdr, const uint8_t *ref, const uint8_t *stat,
 
     // crude hack.  Also correct for STRs
     if (trim_ends) {
-	rstart = trim_str(stat, ref_len, rstart, 1)+5;
-	rend   = trim_str(stat, ref_len, rend, -1)-5;
+	rstart = trim_str(stat, ref_len, rstart, rend, 1)+5;
+	rend   = trim_str(stat, ref_len, rend, rstart, -1)-5;
     }
     if (rend >= ref_len)
 	rend = ref_len-1;
